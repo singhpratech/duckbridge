@@ -39,7 +39,7 @@ impl MssqlTarget {
         }
         if self.trust_cert { c.trust_cert(); }
         c.encryption(if self.encrypt { EncryptionLevel::Required } else { EncryptionLevel::NotSupported });
-        c.application_name("duckdb2mssql");
+        c.application_name("duckbridge");
         c
     }
 

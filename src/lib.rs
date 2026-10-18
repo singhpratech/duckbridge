@@ -1,4 +1,4 @@
-//! duckdb2mssql core library: shared by the CLI and (later) the DuckDB extension.
+//! duckbridge core library: shared by the CLI and (later) the DuckDB extension.
 pub mod core;
 pub mod transpile;
 pub mod storage;

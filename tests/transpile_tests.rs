@@ -1,5 +1,5 @@
 //! Translator unit tests: T-SQL <-> DuckDB <-> PostgreSQL.
-use duckdb2mssql::transpile::{translate, translate_expr, Dialect};
+use duckbridge::transpile::{translate, translate_expr, Dialect};
 use std::collections::HashMap;
 
 fn t2d(sql: &str) -> (String, Vec<String>) {
@@ -77,13 +77,13 @@ fn assert_sql(got: &str, want: &str) { assert_eq!(norm(got), norm(want), "\n got
 #[test] fn json_funcs() { assert_sql(&t2d("SELECT JSON_VALUE(j, '$.a'), ISJSON(j) FROM t").0, "SELECT json_extract_string(j, '$.a'), CASE WHEN json_valid(j) THEN 1 ELSE 0 END FROM t;"); }
 #[test] fn like_bracket_untouched_in_strings() { assert_sql(&t2d("SELECT 1 WHERE x LIKE '[a-z]%' AND y NOT LIKE 'Q%'").0, "SELECT 1 WHERE x ILIKE '[a-z]%' AND y NOT ILIKE 'Q%';"); }
 #[test] fn like_stays_when_binary_collation() {
-    let o = duckdb2mssql::transpile::Options { nocase: false, prelude: false, ..Default::default() };
-    let r = duckdb2mssql::transpile::translate_with("SELECT 1 WHERE x LIKE 'a%'", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &o).unwrap();
+    let o = duckbridge::transpile::Options { nocase: false, prelude: false, ..Default::default() };
+    let r = duckbridge::transpile::translate_with("SELECT 1 WHERE x LIKE 'a%'", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &o).unwrap();
     assert_sql(&r.sql, "SELECT 1 WHERE x LIKE 'a%';");
 }
 #[test] fn prelude_emitted() {
-    let o = duckdb2mssql::transpile::Options::default();
-    let r = duckdb2mssql::transpile::translate_with("SELECT 7 / 2", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &o).unwrap();
+    let o = duckbridge::transpile::Options::default();
+    let r = duckbridge::transpile::translate_with("SELECT 7 / 2", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &o).unwrap();
     assert!(r.sql.contains("SET integer_division = true;"), "{}", r.sql);
     assert!(r.sql.contains("NULLS_FIRST_ON_ASC_LAST_ON_DESC"));
     assert!(r.sql.contains("default_collation = 'nocase'"));
@@ -96,13 +96,13 @@ fn assert_sql(got: &str, want: &str) { assert_eq!(norm(got), norm(want), "\n got
 #[test] fn float_division_back() { assert_sql(&d2t("SELECT a / b, c // d, e / 2.0, 7 / 2 FROM t").0, "SELECT CAST(a AS FLOAT) / b, c / d, e / 2.0, CAST(7 AS FLOAT) / 2 FROM t;"); }
 #[test] fn date_trunc_2019_idioms() { assert_sql(&d2t("SELECT date_trunc('hour', x), date_trunc('second', x) FROM t").0, "SELECT CAST(CONVERT(VARCHAR(13), x, 120) + ':00:00' AS DATETIME2), CAST(CONVERT(VARCHAR(19), x, 120) AS DATETIME2) FROM t;"); }
 #[test] fn target_version_2022_and_2025() {
-    let mk = |v: u16| duckdb2mssql::transpile::Options { target_version: v, prelude: false, ..Default::default() };
+    let mk = |v: u16| duckbridge::transpile::Options { target_version: v, prelude: false, ..Default::default() };
     let sm = HashMap::new();
-    let r22 = duckdb2mssql::transpile::translate_with("SELECT greatest(a, b), date_trunc('hour', x), generate_series(1, 5) FROM t", Dialect::DuckDb, Dialect::Tsql, &sm, &mk(2022)).unwrap();
+    let r22 = duckbridge::transpile::translate_with("SELECT greatest(a, b), date_trunc('hour', x), generate_series(1, 5) FROM t", Dialect::DuckDb, Dialect::Tsql, &sm, &mk(2022)).unwrap();
     assert_sql(&r22.sql, "SELECT greatest(a, b), DATETRUNC(HOUR, x), GENERATE_SERIES(1, 5) FROM t;");
-    let r25 = duckdb2mssql::transpile::translate_with("SELECT regexp_matches(s, 'a+'), regexp_replace(s, 'a', 'b', 'g') FROM t WHERE j::JSON IS NOT NULL", Dialect::DuckDb, Dialect::Tsql, &sm, &mk(2025)).unwrap();
+    let r25 = duckbridge::transpile::translate_with("SELECT regexp_matches(s, 'a+'), regexp_replace(s, 'a', 'b', 'g') FROM t WHERE j::JSON IS NOT NULL", Dialect::DuckDb, Dialect::Tsql, &sm, &mk(2025)).unwrap();
     assert_sql(&r25.sql, "SELECT REGEXP_LIKE(s, 'a+'), REGEXP_REPLACE(s, 'a', 'b') FROM t WHERE CAST(j AS json) IS NOT NULL;");
-    let r19 = duckdb2mssql::transpile::translate_with("SELECT regexp_matches(s, 'a+') FROM t", Dialect::DuckDb, Dialect::Tsql, &sm, &mk(2019)).unwrap();
+    let r19 = duckbridge::transpile::translate_with("SELECT regexp_matches(s, 'a+') FROM t", Dialect::DuckDb, Dialect::Tsql, &sm, &mk(2019)).unwrap();
     assert!(r19.warnings.iter().any(|w| w.contains("regex")));
 }
 #[test] fn iso_parts_back() { assert_sql(&d2t("SELECT isoyear(d), isodow(d) FROM t").0, "SELECT YEAR(DATEADD(DAY, 26 - DATEPART(ISO_WEEK, d), d)), (((DATEPART(WEEKDAY, d) + @@DATEFIRST + 5) % 7) + 1) FROM t;"); }

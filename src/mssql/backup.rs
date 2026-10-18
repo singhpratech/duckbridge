@@ -29,7 +29,7 @@ pub async fn backup(client: &mut MsClient, database: &str, o: &BackupOptions) ->
     let t0 = std::time::Instant::now();
     if let Some(url) = &o.to_url {
         let opts = format!("FORMAT, CHECKSUM, STATS = 10, MAXTRANSFERSIZE = 20971520{}", if o.compression { ", COMPRESSION" } else { "" });
-        let sql = format!("BACKUP DATABASE {} TO URL = N'{}' WITH {opts}, NAME = N'{} full (duckdb2mssql)'", bracket(database), url.replace('\'', "''"), database.replace('\'', "''"));
+        let sql = format!("BACKUP DATABASE {} TO URL = N'{}' WITH {opts}, NAME = N'{} full (duckbridge)'", bracket(database), url.replace('\'', "''"), database.replace('\'', "''"));
         exec_batch(client, &sql).await.context("BACKUP DATABASE TO URL failed (SQL Server 2022+ with a matching CREDENTIAL is required)")?;
         return Ok(BackupResult { server_paths: vec![url.clone()], bytes: 0, seconds: t0.elapsed().as_secs_f64() });
     }
@@ -41,7 +41,7 @@ pub async fn backup(client: &mut MsClient, database: &str, o: &BackupOptions) ->
     };
     let disks: Vec<String> = paths.iter().map(|p| format!("DISK = N'{}'", p.replace('\'', "''"))).collect();
     let opts = format!("FORMAT, INIT, CHECKSUM, STATS = 10{}", if o.compression { ", COMPRESSION" } else { "" });
-    let sql = format!("BACKUP DATABASE {} TO {} WITH {opts}, NAME = N'{} full (duckdb2mssql)'", bracket(database), disks.join(", "), database.replace('\'', "''"));
+    let sql = format!("BACKUP DATABASE {} TO {} WITH {opts}, NAME = N'{} full (duckbridge)'", bracket(database), disks.join(", "), database.replace('\'', "''"));
     exec_batch(client, &sql).await.context("BACKUP DATABASE failed")?;
     let rows = client.simple_query(&format!(
         "SELECT TOP 1 CAST(backup_size AS BIGINT), CAST(ISNULL(compressed_backup_size, backup_size) AS BIGINT) FROM msdb.dbo.backupset WHERE database_name = N'{}' ORDER BY backup_finish_date DESC",

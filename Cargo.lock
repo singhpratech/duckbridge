@@ -742,27 +742,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "duckdb"
-version = "1.10506.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a46cc5f64f534993bae616668a94b1b8e58295c2bd39f85afef7c44297817da"
-dependencies = [
- "arrow",
- "cast",
- "chrono",
- "comfy-table",
- "fallible-iterator 0.3.0",
- "fallible-streaming-iterator",
- "hashlink",
- "libduckdb-sys",
- "num-integer",
- "serde_json",
- "strum",
- "uuid",
-]
-
-[[package]]
-name = "duckdb2mssql"
+name = "duckbridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -791,6 +771,26 @@ dependencies = [
  "tokio-postgres",
  "tokio-util",
  "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "duckdb"
+version = "1.10506.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a46cc5f64f534993bae616668a94b1b8e58295c2bd39f85afef7c44297817da"
+dependencies = [
+ "arrow",
+ "cast",
+ "chrono",
+ "comfy-table",
+ "fallible-iterator 0.3.0",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libduckdb-sys",
+ "num-integer",
+ "serde_json",
+ "strum",
  "uuid",
 ]
 

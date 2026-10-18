@@ -1,12 +1,12 @@
 [package]
-name = "duckdb2mssql"
+name = "duckbridge"
 version = "0.1.0"
 edition = "2021"
-description = "SQL Server <-> DuckDB bridge: copy a SQL Server database into DuckDB, run translated T-SQL on DuckDB, and ship the result back as a restorable SQL Server 2019 .bak (or into PostgreSQL)."
+description = "DuckBridge: move databases between DuckDB and SQL Server / PostgreSQL / Parquet, translate SQL between dialects, and ship results back as a restorable SQL Server .bak."
 license = "MIT"
 
 [[bin]]
-name = "duckdb2mssql"
+name = "duckbridge"
 path = "src/main.rs"
 
 [dependencies]

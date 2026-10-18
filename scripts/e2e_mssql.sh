@@ -6,7 +6,7 @@
 # 4. transpile + run     -> T-SQL job executed on DuckDB
 set -euo pipefail
 cd "$(dirname "$0")/.."
-BIN=${BIN:-target/release/duckdb2mssql}
+BIN=${BIN:-target/release/duckbridge}
 HOST=${MSSQL_HOST:-localhost}; PORT=${MSSQL_PORT:-14319}; USER=${MSSQL_USER:-sa}
 export MSSQL_PASSWORD=${MSSQL_PASSWORD:-'D2m!Strong#2019'}
 CONTAINER=${MSSQL_CONTAINER:-d2m-mssql2019}

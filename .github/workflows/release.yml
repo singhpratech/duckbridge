@@ -23,19 +23,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            name: duckdb2mssql-linux-x86_64
+            name: duckbridge-linux-x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            name: duckdb2mssql-linux-aarch64
+            name: duckbridge-linux-aarch64
           - os: macos-14
             target: aarch64-apple-darwin
-            name: duckdb2mssql-macos-arm64
+            name: duckbridge-macos-arm64
           - os: macos-13
             target: x86_64-apple-darwin
-            name: duckdb2mssql-macos-x86_64
+            name: duckbridge-macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            name: duckdb2mssql-windows-x86_64.exe
+            name: duckbridge-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -49,10 +49,10 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - name: Stage binary (unix)
         if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/duckdb2mssql ${{ matrix.name }}
+        run: cp target/${{ matrix.target }}/release/duckbridge ${{ matrix.name }}
       - name: Stage binary (windows)
         if: runner.os == 'Windows'
-        run: copy target\${{ matrix.target }}\release\duckdb2mssql.exe ${{ matrix.name }}
+        run: copy target\${{ matrix.target }}\release\duckbridge.exe ${{ matrix.name }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}

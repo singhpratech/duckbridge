@@ -1,20 +1,20 @@
-//! duckdb2mssql CLI: SQL Server <-> DuckDB bridge.
+//! duckbridge CLI: DuckDB <-> SQL Server / PostgreSQL / Parquet bridge.
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use duckdb2mssql::core::catalog::{open_readonly, read_catalog, CatalogOptions};
-use duckdb2mssql::core::emit::{Emitter, Flavor};
-use duckdb2mssql::core::script::{write_script, ScriptOptions};
-use duckdb2mssql::core::typemap::{StringMode, Target};
-use duckdb2mssql::mssql::{self, MssqlTarget};
-use duckdb2mssql::storage::{self, Location};
-use duckdb2mssql::transpile::{self, Dialect};
+use duckbridge::core::catalog::{open_readonly, read_catalog, CatalogOptions};
+use duckbridge::core::emit::{Emitter, Flavor};
+use duckbridge::core::script::{write_script, ScriptOptions};
+use duckbridge::core::typemap::{StringMode, Target};
+use duckbridge::mssql::{self, MssqlTarget};
+use duckbridge::storage::{self, Location};
+use duckbridge::transpile::{self, Dialect};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "duckdb2mssql", version, about = "SQL Server <-> DuckDB bridge: import a SQL Server database into DuckDB, run translated T-SQL on DuckDB, export back as a T-SQL script, a live load, a restorable .bak, PostgreSQL or Parquet.")]
+#[command(name = "duckbridge", version, about = "DuckBridge: move data between DuckDB and other databases. import a SQL Server database into DuckDB, run translated T-SQL on DuckDB, export back as a T-SQL script, a live load, a restorable .bak, PostgreSQL or Parquet.")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -281,7 +281,7 @@ fn print_warnings(ws: &[String]) {
 }
 
 fn scratch_dir() -> PathBuf {
-    std::env::temp_dir().join("duckdb2mssql")
+    std::env::temp_dir().join("duckbridge")
 }
 
 fn main() {
@@ -371,8 +371,8 @@ fn run(a: RunArgs, q: bool) -> Result<()> {
     if let Some(t) = a.threads { con.execute_batch(&format!("SET threads={t}"))?; }
     let mut ok = 0;
     let mut failed = 0;
-    for stmt in duckdb2mssql::transpile::tokens::statements(&duckdb2mssql::transpile::tokens::tokenize(&tr.sql, false)) {
-        let s = duckdb2mssql::transpile::tokens::join(&stmt).trim().to_string();
+    for stmt in duckbridge::transpile::tokens::statements(&duckbridge::transpile::tokens::tokenize(&tr.sql, false)) {
+        let s = duckbridge::transpile::tokens::join(&stmt).trim().to_string();
         if s.is_empty() || s.starts_with("--") { continue; }
         let t0 = std::time::Instant::now();
         let is_query = s.to_uppercase().starts_with("SELECT") || s.to_uppercase().starts_with("WITH") || s.to_uppercase().starts_with("FROM");
@@ -389,7 +389,7 @@ fn run(a: RunArgs, q: bool) -> Result<()> {
 }
 
 fn import(a: ImportArgs, q: bool) -> Result<()> {
-    use duckdb2mssql::mssql::import::*;
+    use duckbridge::mssql::import::*;
     if a.out.exists() { if a.overwrite { std::fs::remove_file(&a.out)?; let _ = std::fs::remove_file(format!("{}.wal", a.out.display())); } else { bail!("{} exists; use --overwrite", a.out.display()); } }
     let target = a.conn.target(&a.database);
     let opts = ImportOptions { keys_after_load: a.keys_after_load, include: a.tables, exclude: a.exclude, parallel: a.parallel.unwrap_or_else(num_cpus::get), split_threshold: a.split_threshold, batch_rows: a.batch_rows, schema_map: schema_map(&a.schema_map, &[("dbo", "main")]), nolock: a.nolock };
@@ -427,7 +427,7 @@ fn import(a: ImportArgs, q: bool) -> Result<()> {
 
 fn export(a: ExportArgs, q: bool) -> Result<()> {
     let path = localize(&a.duckdb, q)?;
-    duckdb2mssql::core::typemap::set_mssql_version(a.target_version);
+    duckbridge::core::typemap::set_mssql_version(a.target_version);
     let con = open_readonly(&path.to_string_lossy())?;
     if let Some(m) = &a.memory_limit { con.execute_batch(&format!("SET memory_limit='{m}'"))?; }
     let target_kind = if matches!(a.to, ExportKind::Postgres | ExportKind::Parquet) { Target::Postgres } else { Target::Mssql };
@@ -459,7 +459,7 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
             print_warnings(&ws);
         }
         ExportKind::Server | ExportKind::Bak => {
-            use duckdb2mssql::mssql::load::*;
+            use duckbridge::mssql::load::*;
             let em = Emitter::new(Flavor::Mssql, sm);
             let target = a.conn.target("master");
             let lo = LoadOptions { database: db_name.clone(), drop_existing: a.drop_existing, with_data: !a.schema_only, parallel, batch_rows: a.batch_rows, method: match a.method { MethodArg::Bulk => LoadMethod::Bulk, MethodArg::Insert => LoadMethod::Insert }, recovery_simple: true, pk_after_load: !a.pk_inline, split_threshold: a.split_threshold, order_by_key: a.order_by_key };
@@ -480,7 +480,7 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
             rt.block_on(finish_schema(&mut c, &cat, &em, &lo, &mut warnings))?;
             log(q, "constraints, indexes and views created");
             if a.to == ExportKind::Bak {
-                use duckdb2mssql::mssql::backup::*;
+                use duckbridge::mssql::backup::*;
                 let out = a.out.clone().unwrap_or_else(|| format!("{db_name}.bak"));
                 let loc = Location::parse(&out)?;
                 let bo = BackupOptions { server_dir: a.backup_dir.clone(), compression: a.compression, stripes: a.stripes.max(1), file_name: loc.file_name(), to_url: a.backup_to_url.clone() };
@@ -532,8 +532,8 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
         ExportKind::Postgres => {
             let em = Emitter::new(Flavor::Postgres, sm);
             let dsn = a.pg_dsn.clone().context("--pg-dsn (or PG_DSN) is required for --to postgres")?;
-            let po = duckdb2mssql::pg::PgOptions { dsn, drop_existing: a.drop_existing, with_data: !a.schema_only, parallel };
-            let rep = duckdb2mssql::pg::load(&con, &mut cat, &em, &po, progress)?;
+            let po = duckbridge::pg::PgOptions { dsn, drop_existing: a.drop_existing, with_data: !a.schema_only, parallel };
+            let rep = duckbridge::pg::load(&con, &mut cat, &em, &po, progress)?;
             println!("loaded {} rows into PostgreSQL in {:.1}s", rep.rows, rep.seconds);
             print_warnings(&rep.warnings);
         }
@@ -541,8 +541,8 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
             let out = a.out.clone().unwrap_or_else(|| format!("{db_name}_parquet"));
             let loc = Location::parse(&out)?;
             let local_dir = if loc.is_local() { PathBuf::from(&out) } else { scratch_dir().join(loc.file_name()) };
-            let po = duckdb2mssql::parquet::ParquetOptions { compression: a.parquet_compression.clone(), row_group_size: 122_880, partition_rows: None };
-            let files = duckdb2mssql::parquet::export_parquet(&con, &cat, &local_dir, &po, &mut |t, n| log(qq, format!("  {t}: {n} rows")))?;
+            let po = duckbridge::parquet::ParquetOptions { compression: a.parquet_compression.clone(), row_group_size: 122_880, partition_rows: None };
+            let files = duckbridge::parquet::export_parquet(&con, &cat, &local_dir, &po, &mut |t, n| log(qq, format!("  {t}: {n} rows")))?;
             // schema script alongside (PostgreSQL flavour is the most portable DDL)
             let em = Emitter::new(Flavor::Postgres, sm);
             let mut ddl = String::new();

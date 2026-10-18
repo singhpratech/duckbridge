@@ -92,7 +92,7 @@ pub fn translate_with(sql: &str, src: Dialect, dst: Dialect, schema_map: &HashMa
     ctx.float_division = opts.float_division;
     let mut out = String::new();
     if opts.prelude && src == Dialect::Tsql && dst == Dialect::DuckDb {
-        out.push_str("-- duckdb2mssql prelude: make DuckDB behave like SQL Server for this script\n");
+        out.push_str("-- duckbridge prelude: make DuckDB behave like SQL Server for this script\n");
         for p in duckdb_prelude(opts.nocase) { out.push_str(p); out.push_str(";\n"); }
     }
     let stmts = tokens::statements(&toks);

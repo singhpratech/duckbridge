@@ -1,7 +1,10 @@
-# duckdb2mssql
+# DuckBridge
 
-**SQL Server ⇄ DuckDB bridge.** Keep SQL Server as the system of record, do the heavy processing in
-DuckDB, ship the result back as a genuine, restorable SQL Server `.bak`.
+**DuckDB ⇄ SQL Server / PostgreSQL / Parquet bridge.** Keep your database of record where it is, do the
+heavy processing in DuckDB, ship the result back as a genuine, restorable SQL Server `.bak`, a live
+load, a PostgreSQL load, or Parquet files. Built to grow: each target is a self-contained module
+(`src/mssql`, `src/pg`, `src/parquet.rs`) plus a dialect rule set in `src/transpile`, so adding
+another engine means adding one of each.
 
 One static binary (Linux, macOS, Windows). No ODBC driver, no Python, no `bcp` needed on the machine.
 
@@ -30,26 +33,26 @@ Cloud clients are built in (SigV4 / Azure Shared Key or SAS), credentials come f
 export MSSQL_PASSWORD='...'
 
 # 1. SQL Server -> DuckDB (8 parallel streams, tables >= 20M rows split into key ranges)
-duckdb2mssql import work.duckdb --host sql01 --user sa --database Sales -j 8
+duckbridge import work.duckdb --host sql01 --user sa --database Sales -j 8
 
 # 2. run your existing T-SQL on DuckDB
-duckdb2mssql run work.duckdb nightly_kpis.sql --from tsql --memory-limit 40GB --threads 8
+duckbridge run work.duckdb nightly_kpis.sql --from tsql --memory-limit 40GB --threads 8
 
 # 3. ship the result back as a restorable .bak (only the tables that changed)
-duckdb2mssql export work.duckdb --to bak --tables customer_kpi \
+duckbridge export work.duckdb --to bak --tables customer_kpi \
     --host sql01 --user sa --database Sales_kpi --drop-existing \
     --backup-dir /var/opt/mssql/backup --fetch local --out s3://my-bucket/kpi/Sales_kpi.bak \
     --verify-restore --drop-staging
 
 # other targets
-duckdb2mssql export work.duckdb --to script --out Sales.sql --create-database   # sqlcmd -i Sales.sql
-duckdb2mssql export work.duckdb --to server --host sql01 --database Sales_copy   # live load, no .bak
-duckdb2mssql export work.duckdb --to postgres --pg-dsn "host=pg user=postgres password=x dbname=sales"
-duckdb2mssql export work.duckdb --to parquet --out s3://lake/sales/
+duckbridge export work.duckdb --to script --out Sales.sql --create-database   # sqlcmd -i Sales.sql
+duckbridge export work.duckdb --to server --host sql01 --database Sales_copy   # live load, no .bak
+duckbridge export work.duckdb --to postgres --pg-dsn "host=pg user=postgres password=x dbname=sales"
+duckbridge export work.duckdb --to parquet --out s3://lake/sales/
 
 # translate a script without running it (prelude included), or target a newer SQL Server on the way back
-duckdb2mssql transpile job.sql --from tsql --to duckdb -o job.duckdb.sql
-duckdb2mssql transpile report.duckdb.sql --from duckdb --to tsql --target-version 2022
+duckbridge transpile job.sql --from tsql --to duckdb -o job.duckdb.sql
+duckbridge transpile report.duckdb.sql --from duckdb --to tsql --target-version 2022
 ```
 
 ### Making DuckDB behave like SQL Server
@@ -143,6 +146,39 @@ covers `LIMIT`/`OFFSET`, `::` casts, `||`, interval arithmetic → `DATEADD`, `s
 temp tables, `RETURNING` → `OUTPUT`, and so on. Anything that cannot be translated faithfully (procedural `IF`/`WHILE`,
 cursors, regex on 2019, `QUALIFY`, nested types…) is left in place or commented out **and reported as a warning**, never
 silently changed.
+
+## Roadmap
+
+DuckBridge is organised so that every engine is a pair: a **target module** (catalog reader, bulk
+loader, backup/restore) and a **dialect rule set** for the translator. SQL Server and PostgreSQL are
+done; the plan for the rest, in priority order:
+
+| Phase | Engine / feature | What it adds | Status |
+|---|---|---|---|
+| 1 | SQL Server 2019 / 2022 / 2025 | import, live load, `.bak`, T-SQL ⇄ DuckDB | done |
+| 1 | PostgreSQL | export via `COPY`, DuckDB ⇄ PostgreSQL SQL | export done; import next |
+| 1 | Parquet | export, any engine can absorb it | done |
+| 2 | **DuckDB extension** (`duckbridge`) | `CALL bridge_import('mssql://…')`, `CALL bridge_export(…)`, `SELECT transpile('tsql','duckdb', sql)` straight from DuckDB SQL; community-extension packaging | in progress, see below |
+| 2 | PostgreSQL import | binary `COPY TO STDOUT`, key-range parallel streams, identity → sequence | planned |
+| 3 | MySQL / MariaDB | `LOAD DATA LOCAL INFILE`, MySQL dialect rules | planned |
+| 3 | Oracle | `SQL*Loader`-style direct path over OCI-free wire protocol, PL/SQL-lite rules | planned |
+| 3 | Snowflake / BigQuery / Databricks | Parquet stage + `COPY INTO`, dialect rules | planned |
+| 3 | SQLite | direct file read, dialect rules | planned |
+| 4 | Change-data pipelines | incremental import by watermark / CDC tables, partitioned `.bak` shipping | planned |
+| 4 | Procedural T-SQL | IF / WHILE / cursors to a DuckDB job runner | research |
+
+### DuckDB extension status
+
+The whole engine already lives in the library crate (`src/lib.rs`); the CLI is a thin wrapper. The
+extension is therefore a packaging job rather than a rewrite:
+
+1. Add a `duckbridge-ext` crate built with `duckdb-loadable-macros` exposing table functions
+   `bridge_import`, `bridge_export`, `bridge_transpile` and scalar `transpile(from, to, sql)`.
+2. Build with the DuckDB community-extension Rust template (one CI job per platform, same matrix
+   as the binary release).
+3. Submit to `duckdb/community-extensions` so users can `INSTALL duckbridge FROM community;`.
+
+Not started yet; the binary is the supported path today.
 
 ## Build
 
