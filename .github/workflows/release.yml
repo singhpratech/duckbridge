@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# the default GITHUB_TOKEN is read-only on new repos; creating the Release needs contents: write
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
