@@ -30,7 +30,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             name: duckbridge-macos-arm64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             name: duckbridge-macos-x86_64
           - os: windows-latest
@@ -54,6 +54,7 @@ jobs:
         if: runner.os == 'Windows'
         run: copy target\${{ matrix.target }}\release\duckbridge.exe ${{ matrix.name }}
       - uses: actions/upload-artifact@v4
+        continue-on-error: true   # Actions artifact storage is quota-limited; the Release step below is what matters
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
@@ -81,7 +82,7 @@ jobs:
             target: aarch64-apple-darwin
             platform: osx_arm64
             lib: libduckbridge_ext.dylib
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             platform: osx_amd64
             lib: libduckbridge_ext.dylib
@@ -112,6 +113,7 @@ jobs:
           ./pack.sh target/${{ matrix.target }}/release/${{ matrix.lib }} build/duckbridge.duckdb_extension ${{ matrix.platform }} v1.5.6 v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           gzip -9 -c build/duckbridge.duckdb_extension > duckbridge-${{ matrix.platform }}.duckdb_extension.gz
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: duckbridge-extension-${{ matrix.platform }}
           path: extension/duckbridge-${{ matrix.platform }}.duckdb_extension.gz

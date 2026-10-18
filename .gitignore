@@ -4,3 +4,5 @@
 tests/fixtures/sample.duckdb
 *.duckdb.wal
 *.bak
+# internal strategy notes and discussion log, never published
+/private/
