@@ -1,0 +1,45 @@
+[package]
+name = "duckdb2mssql"
+version = "0.1.0"
+edition = "2021"
+description = "SQL Server <-> DuckDB bridge: copy a SQL Server database into DuckDB, run translated T-SQL on DuckDB, and ship the result back as a restorable SQL Server 2019 .bak (or into PostgreSQL)."
+license = "MIT"
+
+[[bin]]
+name = "duckdb2mssql"
+path = "src/main.rs"
+
+[dependencies]
+duckdb = { version = "1", features = ["bundled", "chrono", "uuid", "serde_json"] }
+tiberius = { version = "0.13", default-features = false, features = ["rustls", "chrono", "rust_decimal", "tds73"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+chrono = "0.4"
+uuid = "1"
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["rustls"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+percent-encoding = "2"
+indicatif = "0.17"
+regex = "1"
+tempfile = "3"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
+num_cpus = "1"
+bytes = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

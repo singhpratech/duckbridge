@@ -1,0 +1,4 @@
+/target
+tests/fixtures/sample.duckdb
+*.duckdb.wal
+*.bak
