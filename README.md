@@ -33,7 +33,7 @@ Cloud clients are built in (SigV4 / Azure Shared Key or SAS), credentials come f
 export MSSQL_PASSWORD='...'
 
 # 1. SQL Server -> DuckDB (8 parallel streams, tables >= 20M rows split into key ranges)
-duckbridge import work.duckdb --host sql01 --user sa --database Sales -j 8
+duckbridge import work.duckdb --host sql01 --database Sales -j 8          # Windows auth by default; --user sa --password … for SQL logins
 
 # 2. run your existing T-SQL on DuckDB
 duckbridge run work.duckdb nightly_kpis.sql --from tsql --memory-limit 40GB --threads 8
@@ -54,6 +54,28 @@ duckbridge export work.duckdb --to parquet --out s3://lake/sales/
 duckbridge transpile job.sql --from tsql --to duckdb -o job.duckdb.sql
 duckbridge transpile report.duckdb.sql --from duckdb --to tsql --target-version 2022
 ```
+
+### Connecting to SQL Server: Windows authentication by default
+
+Connection flags (`--host --port --user --password`, env `MSSQL_*`) and the `mssql://` URLs used by
+`cp` and the extension pick the login the same way:
+
+| You give | Login used | Platforms |
+|---|---|---|
+| nothing (no `--user`) | **Integrated Windows authentication**: the identity running duckbridge (SSPI, Kerberos/NTLM) | Windows |
+| `--user 'CORP\svc_etl' --password …` or `--user svc_etl@corp.local` | **Windows credentials** (NTLM) | Windows, Linux, macOS |
+| `--user svc --password … --windows-auth` (or `?trusted_connection=yes` in a URL) | Windows credentials, no domain prefix | all |
+| `--user sa --password …` | SQL Server login | all |
+
+```bash
+duckbridge import work.duckdb --host sql01 --database Sales                      # Windows: your own identity
+duckbridge import work.duckdb --host sql01 --database Sales --user 'CORP\etl' --password "$PW"   # Linux box, domain account
+SELECT * FROM bridge_import('mssql://CORP%5Cetl:p%40ss@sql01/Sales');             # extension; \ is %5C
+```
+
+No system Kerberos libraries are needed: Windows uses the OS SSPI, other platforms use a pure-Rust
+NTLM implementation. `--trust-cert` (default on) accepts self-signed server certificates; TLS is
+always on unless `--encrypt false`.
 
 ### Making DuckDB behave like SQL Server
 

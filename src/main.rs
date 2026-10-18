@@ -107,8 +107,10 @@ struct ConnArgs {
     host: String,
     #[arg(long, env = "MSSQL_PORT", default_value_t = 1433)]
     port: u16,
-    #[arg(long, env = "MSSQL_USER", default_value = "sa")]
-    user: String,
+    /// SQL login, or Windows credentials as DOMAIN\user / user@domain. Omit it to use
+    /// integrated Windows authentication (the identity running duckbridge; Windows only).
+    #[arg(long, env = "MSSQL_USER")]
+    user: Option<String>,
     #[arg(long, env = "MSSQL_PASSWORD", default_value = "", hide_env_values = true)]
     password: String,
     /// Accept the server's TLS certificate without validation (self-signed / containers)
@@ -116,14 +118,14 @@ struct ConnArgs {
     trust_cert: bool,
     #[arg(long, default_value_t = true)]
     encrypt: bool,
-    /// Windows integrated authentication (Windows only)
+    /// Treat --user/--password as Windows credentials even without a DOMAIN\ prefix
     #[arg(long)]
     windows_auth: bool,
 }
 
 impl ConnArgs {
     fn target(&self, database: &str) -> MssqlTarget {
-        MssqlTarget { host: self.host.clone(), port: self.port, user: self.user.clone(), password: self.password.clone(), database: database.into(), trust_cert: self.trust_cert, encrypt: self.encrypt, windows_auth: self.windows_auth }
+        MssqlTarget { host: self.host.clone(), port: self.port, user: self.user.clone().unwrap_or_default(), password: self.password.clone(), database: database.into(), trust_cert: self.trust_cert, encrypt: self.encrypt, windows_auth: self.windows_auth }
     }
 }
 

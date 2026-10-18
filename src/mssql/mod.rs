@@ -11,6 +11,15 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 pub type MsClient = Client<Compat<TcpStream>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    SqlLogin,
+    /// NTLM with explicit DOMAIN\user credentials
+    Windows,
+    /// The identity of the running process (Windows SSPI)
+    Integrated,
+}
+
 #[derive(Debug, Clone)]
 pub struct MssqlTarget {
     pub host: String,
@@ -24,27 +33,51 @@ pub struct MssqlTarget {
 }
 
 impl MssqlTarget {
-    pub fn config(&self, database: &str) -> Config {
+    /// Which login to use. Windows authentication is the default whenever no SQL login is given:
+    ///
+    /// * no user                      -> integrated (the process identity; Windows only)
+    /// * `DOMAIN\\user` / `user@domain` -> Windows credentials (NTLM), works on every platform
+    /// * `--windows-auth` with a plain user -> treated as Windows credentials too
+    /// * otherwise                    -> SQL Server login
+    pub fn auth_kind(&self) -> AuthKind {
+        let user = self.user.trim();
+        if user.is_empty() { return AuthKind::Integrated; }
+        if self.windows_auth || user.contains('\\') || user.contains('@') { return AuthKind::Windows; }
+        AuthKind::SqlLogin
+    }
+
+    fn auth_method(&self) -> Result<AuthMethod> {
+        match self.auth_kind() {
+            AuthKind::SqlLogin => Ok(AuthMethod::sql_server(&self.user, &self.password)),
+            AuthKind::Windows => {
+                #[cfg(any(windows, unix))]
+                { Ok(AuthMethod::windows(&self.user, &self.password)) }
+                #[cfg(not(any(windows, unix)))]
+                { anyhow::bail!("Windows authentication is not available on this platform") }
+            }
+            AuthKind::Integrated => {
+                #[cfg(windows)]
+                { Ok(AuthMethod::Integrated) }
+                #[cfg(not(windows))]
+                { anyhow::bail!("no SQL Server login given. Integrated Windows authentication (the process identity) only works on Windows; on Linux/macOS pass Windows credentials as --user 'DOMAIN\\user' --password ... (or mssql://DOMAIN%5Cuser:pw@host/db), or a SQL login with --user/--password") }
+            }
+        }
+    }
+
+    pub fn config(&self, database: &str) -> Result<Config> {
         let mut c = Config::new();
         c.host(&self.host);
         c.port(self.port);
         c.database(database);
-        if self.windows_auth {
-            #[cfg(windows)]
-            { c.authentication(AuthMethod::Integrated); }
-            #[cfg(not(windows))]
-            { c.authentication(AuthMethod::sql_server(&self.user, &self.password)); }
-        } else {
-            c.authentication(AuthMethod::sql_server(&self.user, &self.password));
-        }
+        c.authentication(self.auth_method()?);
         if self.trust_cert { c.trust_cert(); }
         c.encryption(if self.encrypt { EncryptionLevel::Required } else { EncryptionLevel::NotSupported });
         c.application_name("duckbridge");
-        c
+        Ok(c)
     }
 
     pub async fn connect(&self, database: &str) -> Result<MsClient> {
-        let cfg = self.config(database);
+        let cfg = self.config(database)?;
         let tcp = TcpStream::connect(cfg.get_addr()).await.with_context(|| format!("connecting to SQL Server at {}:{}", self.host, self.port))?;
         tcp.set_nodelay(true)?;
         let client = Client::connect(cfg, tcp.compat_write()).await.context("SQL Server login failed")?;

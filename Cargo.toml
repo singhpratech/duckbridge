@@ -39,11 +39,19 @@ percent-encoding = "2"
 indicatif = "0.17"
 regex = "1"
 tempfile = "3"
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
+# <0.7.18: newer postgres-protocol wants hmac/sha2 0.11 final, while tiberius' sspi-rs pins their release candidates
+tokio-postgres = { version = "0.7, <0.7.18", features = ["with-chrono-0_4", "with-uuid-1"] }
 num_cpus = "1"
 bytes = "1"
 log = "0.4"
 env_logger = "0.11"
+
+# Windows authentication: process identity via SSPI on Windows, explicit DOMAIN\user NTLM
+# credentials everywhere through the pure-Rust sspi crate (no system Kerberos libraries needed).
+[target.'cfg(windows)'.dependencies]
+tiberius = { version = "0.13", default-features = false, features = ["winauth"] }
+[target.'cfg(unix)'.dependencies]
+tiberius = { version = "0.13", default-features = false, features = ["sspi-rs"] }
 
 [profile.release]
 opt-level = 3

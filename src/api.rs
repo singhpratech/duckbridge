@@ -86,12 +86,12 @@ impl Dsn {
         MssqlTarget {
             host: self.host.clone(),
             port: self.port.unwrap_or(1433),
-            user: self.user.clone().unwrap_or_else(|| "sa".into()),
+            user: self.user.clone().unwrap_or_default(),
             password: self.password.clone().unwrap_or_default(),
             database: database.map(|s| s.to_string()).or_else(|| self.database.clone()).unwrap_or_else(|| "master".into()),
             trust_cert: self.flag("trust_cert", true) || self.flag("trustservercertificate", true),
             encrypt: self.flag("encrypt", true),
-            windows_auth: self.flag("windows_auth", false) || self.flag("integrated", false),
+            windows_auth: self.flag("windows_auth", false) || self.flag("integrated", false) || self.flag("trusted_connection", false) || self.flag("integrated_security", false),
         }
     }
 }
@@ -445,7 +445,16 @@ mod tests {
         let d = parse_dsn("mssql://sql01,1433").unwrap();
         assert_eq!((d.host.as_str(), d.port, d.database.clone(), d.user.clone()), ("sql01", Some(1433), None, None));
         let t = d.mssql_target(Some("X"));
-        assert_eq!((t.user.as_str(), t.port, t.database.as_str()), ("sa", 1433, "X"));
+        assert_eq!((t.user.as_str(), t.port, t.database.as_str()), ("", 1433, "X"));
+        assert_eq!(t.auth_kind(), crate::mssql::AuthKind::Integrated);
+        let t = parse_dsn("mssql://CORP%5Csvc_etl:pw@sql01/Sales").unwrap().mssql_target(None);
+        assert_eq!((t.user.as_str(), t.auth_kind()), ("CORP\\svc_etl", crate::mssql::AuthKind::Windows));
+        let t = parse_dsn("mssql://etl@corp.local:pw@sql01/Sales").unwrap().mssql_target(None);
+        assert_eq!((t.user.as_str(), t.auth_kind()), ("etl@corp.local", crate::mssql::AuthKind::Windows));
+        let t = parse_dsn("mssql://sa:pw@sql01/Sales").unwrap().mssql_target(None);
+        assert_eq!(t.auth_kind(), crate::mssql::AuthKind::SqlLogin);
+        let t = parse_dsn("mssql://svc:pw@sql01/Sales?trusted_connection=yes").unwrap().mssql_target(None);
+        assert_eq!(t.auth_kind(), crate::mssql::AuthKind::Windows);
         let d = parse_dsn("postgres://u@pg/db").unwrap();
         assert_eq!((d.host.as_str(), d.port, d.database.as_deref()), ("pg", None, Some("db")));
         assert!(parse_dsn("nonsense").is_err());
