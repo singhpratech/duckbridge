@@ -4,6 +4,7 @@
 # DUCKDB_VERSION, sqlcmd, docker. Builds the extension if build/ is missing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+[ -f private/env.sh ] && . private/env.sh   # optional, gitignored: local overrides for the variables below
 HOST=${MSSQL_HOST:-localhost}; PORT=${MSSQL_PORT:-14319}; USER=${MSSQL_USER:-sa}
 export MSSQL_PASSWORD=${MSSQL_PASSWORD:-'D2m!Strong#2019'}
 CONTAINER=${MSSQL_CONTAINER:-d2m-mssql2019}
@@ -11,6 +12,7 @@ SQLCMD=${SQLCMD:-/opt/mssql-tools18/bin/sqlcmd}
 DUCK=${DUCK:-$HOME/.local/bin/duckdb}
 EXT=${EXT:-extension/build/duckbridge.duckdb_extension}
 WORK=${WORK:-$(mktemp -d)}
+PG_CONTAINER=${PG_CONTAINER:-postgres}; PG_USER=${PG_USER:-postgres}; PG_PASSWORD=${PG_PASSWORD:-postgres}; PG_PORT=${PG_PORT:-5432}
 PW_ENC=$(printf '%s' "$MSSQL_PASSWORD" | sed 's/!/%21/g; s/#/%23/g; s/@/%40/g; s/:/%3A/g; s/\//%2F/g')
 DSN="mssql://$USER:$PW_ENC@$HOST:$PORT"
 q() { "$SQLCMD" -S "$HOST,$PORT" -U "$USER" -P "$MSSQL_PASSWORD" -C -h -1 -W -Q "$1" | sed '/rows affected/d;/^$/d'; }
@@ -85,11 +87,11 @@ d "SELECT * FROM bridge_export('script:$WORK/kpi.sql', database := 'd2m_extscrip
 check "script runs" "$(q 'SET NOCOUNT ON; SELECT COUNT(*) FROM d2m_extscript.dbo.kpi')" "3"
 
 echo "== 7. postgres (optional) =="
-if docker ps --format '{{.Names}}' | grep -q '^mandiropedia-postgres$'; then
-  docker exec mandiropedia-postgres psql -U mandiropedia -d postgres -qc "DROP DATABASE IF EXISTS d2m_extpg" -c "CREATE DATABASE d2m_extpg" >/dev/null
-  d "SELECT * FROM bridge_export('postgres://mandiropedia:mandiropedia_dev@localhost:5432/d2m_extpg', tables := 'kpi', drop_existing := true)" > "$WORK/pg.txt"
-  check "pg rows" "$(docker exec mandiropedia-postgres psql -U mandiropedia -d d2m_extpg -tAc 'SELECT count(*) FROM public.kpi')" "3"
-  docker exec mandiropedia-postgres psql -U mandiropedia -d postgres -qc "DROP DATABASE d2m_extpg" >/dev/null
+if docker ps --format '{{.Names}}' | grep -q "^$PG_CONTAINER\$"; then
+  docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -qc "DROP DATABASE IF EXISTS d2m_extpg" -c "CREATE DATABASE d2m_extpg" >/dev/null
+  d "SELECT * FROM bridge_export('postgres://$PG_USER:$PG_PASSWORD@localhost:$PG_PORT/d2m_extpg', tables := 'kpi', drop_existing := true)" > "$WORK/pg.txt"
+  check "pg rows" "$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d d2m_extpg -tAc 'SELECT count(*) FROM public.kpi')" "3"
+  docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -qc "DROP DATABASE d2m_extpg" >/dev/null
 else
   echo "  skipped (no postgres container)"
 fi

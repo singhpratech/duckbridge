@@ -194,8 +194,19 @@ done; the plan for the rest, in priority order:
 The same engine ships as a loadable DuckDB extension (`extension/`), so everything above can be
 driven from inside DuckDB itself, with no CLI process:
 
+Install: download `duckbridge-<platform>.duckdb_extension.zip` for your platform from the
+[Releases](../../releases) page (`linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`,
+`windows_amd64`), unzip it, and keep the file name `duckbridge.duckdb_extension`: DuckDB derives
+the extension's entry point from the file name, so a renamed file will not load. The build is
+pinned to DuckDB 1.5.6 and is not yet signed:
+
+```bash
+unzip duckbridge-linux_amd64.duckdb_extension.zip        # -> duckbridge.duckdb_extension
+duckdb -unsigned work.duckdb                              # or SET allow_unsigned_extensions = true
+```
+
 ```sql
-LOAD 'duckbridge.duckdb_extension';                      -- duckdb -unsigned until it is signed
+LOAD '/path/to/duckbridge.duckdb_extension';
 
 -- SQL Server -> this DuckDB database (parallel key-range streams, identity -> sequence)
 SELECT * FROM bridge_import('mssql://sa:p%40ss@sql01:1433/Sales', parallel := 8, keys_after_load := true);
