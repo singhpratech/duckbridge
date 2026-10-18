@@ -1,4 +1,5 @@
-//! duckbridge core library: shared by the CLI and (later) the DuckDB extension.
+//! duckbridge core library: shared by the CLI and the DuckDB extension (extension/).
+pub mod api;
 pub mod core;
 pub mod transpile;
 pub mod storage;

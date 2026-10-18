@@ -55,7 +55,7 @@ pub fn load(con: &Connection, cat: &mut Catalog, em: &Emitter, o: &PgOptions, pr
         let n_workers = o.parallel.max(1).min(queue.lock().unwrap().len().max(1));
         let mut handles = vec![];
         for _ in 0..n_workers {
-            let con = con.try_clone()?;
+            let con = crate::core::conn::acquire(con)?;
             let queue = queue.clone();
             let total = total.clone();
             let progress = progress.clone();
@@ -65,17 +65,20 @@ pub fn load(con: &Connection, cat: &mut Catalog, em: &Emitter, o: &PgOptions, pr
             handles.push(std::thread::spawn(move || -> Result<()> {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
                 let em = Emitter::new(Flavor::Postgres, sm);
-                rt.block_on(async move {
+                let con_ref = &con;
+                let r = rt.block_on(async move {
                     let c = connect(&dsn).await?;
                     loop {
                         let idx = { queue.lock().unwrap().pop() };
                         let Some(idx) = idx else { break };
                         let t = &tables[idx];
-                        let n = copy_table(&con, &c, t, &em, &progress).await.with_context(|| format!("loading {}.{}", t.schema, t.name))?;
+                        let n = copy_table(con_ref, &c, t, &em, &progress).await.with_context(|| format!("loading {}.{}", t.schema, t.name))?;
                         total.fetch_add(n, Ordering::Relaxed);
                     }
                     Ok::<(), anyhow::Error>(())
-                })
+                });
+                crate::core::conn::release(con);
+                r
             }));
         }
         for h in handles { h.join().map_err(|_| anyhow::anyhow!("worker thread panicked"))??; }

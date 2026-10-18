@@ -158,7 +158,7 @@ done; the plan for the rest, in priority order:
 | 1 | SQL Server 2019 / 2022 / 2025 | import, live load, `.bak`, T-SQL ⇄ DuckDB | done |
 | 1 | PostgreSQL | export via `COPY`, DuckDB ⇄ PostgreSQL SQL | export done; import next |
 | 1 | Parquet | export, any engine can absorb it | done |
-| 2 | **DuckDB extension** (`duckbridge`) | `CALL bridge_import('mssql://…')`, `CALL bridge_export(…)`, `SELECT transpile('tsql','duckdb', sql)` straight from DuckDB SQL; community-extension packaging | in progress, see below |
+| 2 | **DuckDB extension** (`duckbridge`) | `bridge_import`, `bridge_export`, `bridge_run`, `bridge_transpile` straight from DuckDB SQL | done (see below); community-extension submission next |
 | 2 | PostgreSQL import | binary `COPY TO STDOUT`, key-range parallel streams, identity → sequence | planned |
 | 3 | MySQL / MariaDB | `LOAD DATA LOCAL INFILE`, MySQL dialect rules | planned |
 | 3 | Oracle | `SQL*Loader`-style direct path over OCI-free wire protocol, PL/SQL-lite rules | planned |
@@ -167,18 +167,61 @@ done; the plan for the rest, in priority order:
 | 4 | Change-data pipelines | incremental import by watermark / CDC tables, partitioned `.bak` shipping | planned |
 | 4 | Procedural T-SQL | IF / WHILE / cursors to a DuckDB job runner | research |
 
-### DuckDB extension status
+### DuckDB extension
 
-The whole engine already lives in the library crate (`src/lib.rs`); the CLI is a thin wrapper. The
-extension is therefore a packaging job rather than a rewrite:
+The same engine ships as a loadable DuckDB extension (`extension/`), so everything above can be
+driven from inside DuckDB itself, with no CLI process:
 
-1. Add a `duckbridge-ext` crate built with `duckdb-loadable-macros` exposing table functions
-   `bridge_import`, `bridge_export`, `bridge_transpile` and scalar `transpile(from, to, sql)`.
-2. Build with the DuckDB community-extension Rust template (one CI job per platform, same matrix
-   as the binary release).
-3. Submit to `duckdb/community-extensions` so users can `INSTALL duckbridge FROM community;`.
+```sql
+LOAD 'duckbridge.duckdb_extension';                      -- duckdb -unsigned until it is signed
 
-Not started yet; the binary is the supported path today.
+-- SQL Server -> this DuckDB database (parallel key-range streams, identity -> sequence)
+SELECT * FROM bridge_import('mssql://sa:p%40ss@sql01:1433/Sales', parallel := 8, keys_after_load := true);
+
+-- run the team's T-SQL against DuckDB; the SQL Server compatibility prelude is applied to
+-- the extension's own session only, your session's settings are untouched
+SELECT * FROM bridge_run('SELECT c.id, SUM(o.amount) AS total INTO dbo.kpi FROM dbo.customers c
+                          JOIN dbo.orders o ON o.customer_id = c.id GROUP BY c.id;');
+
+-- ship it back: live load into a heap, clustered PK after, then a verified, restorable .bak
+SELECT * FROM bridge_export('mssql://sa:p%40ss@sql01:1433/Sales_kpi', tables := 'kpi',
+                            bak := 's3://backups/Sales_kpi.bak', fetch_via := 'local', verify_restore := true);
+
+SELECT * FROM bridge_export('postgres://u:p@pg/analytics', tables := 'kpi');
+SELECT * FROM bridge_export('parquet:s3://lake/sales/', parquet_compression := 'zstd');
+SELECT * FROM bridge_export('script:/tmp/Sales.sql', database := 'Sales', create_database := true);
+
+-- text in, text out
+SELECT bridge_transpile('tsql', 'duckdb', 'SELECT TOP 5 ISNULL(a, 0) FROM dbo.t');
+SELECT bridge_transpile('duckdb', 'tsql', 'SELECT greatest(a, b) FROM t', 2022);   -- target version
+SELECT bridge_prelude(true);                                                       -- the SET statements
+```
+
+Every table function returns `(object, kind, rows, note)` rows: one per table/view, a `summary`,
+and any `warning`s. Named parameters mirror the CLI flags (`tables`, `exclude`, `schema_map`,
+`parallel`, `split_threshold`, `batch_rows`, `drop_existing`, `schema_only`, `overwrite`, `target_version`,
+`string_mode`, `method`, `pk_inline`, `order_by_key`, `bak`, `backup_dir`, `fetch_via`, `stripes`,
+`compression`, `verify_restore`, `drop_staging`, `backup_to_url`, `create_database`,
+`parquet_compression`; `bridge_run` takes `from`, `nocase`, `schema_map`, `continue_on_error`).
+URL-encode special characters in passwords (`!` → `%21`, `#` → `%23`, `@` → `%40`).
+
+Build and test:
+
+```bash
+cd extension && make release        # -> build/duckbridge.duckdb_extension
+make test                           # scripts/e2e_extension.sh against the local SQL Server container
+```
+
+How it works: the extension opens a pool of 64 connections to the host database when loaded
+and runs every operation on those, so parallel workers get their own connections and nothing
+touches your transaction. Two consequences worth knowing: `parallel` is capped at 64, and the
+database stays open until the process exits, so a `.wal` file may remain next to the database
+after a session that used the bridge (DuckDB replays it on the next open; the bridge checkpoints
+after each operation to keep it small). The extension is built on DuckDB's C extension API via
+`duckdb-rs`, which currently requires the *unstable* struct, so each binary is pinned to one
+DuckDB release (`v1.5.6` today, see `extension/Makefile`). CI builds Linux x86_64/arm64,
+macOS Intel/ARM and Windows. Community-extension submission (`INSTALL duckbridge FROM community`)
+is the next step; until then, load the file with `duckdb -unsigned` or `SET allow_unsigned_extensions = true`.
 
 ## Build
 

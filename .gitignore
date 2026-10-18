@@ -1,4 +1,6 @@
 /target
+/extension/target
+/extension/build
 tests/fixtures/sample.duckdb
 *.duckdb.wal
 *.bak

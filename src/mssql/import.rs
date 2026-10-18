@@ -314,7 +314,7 @@ pub fn copy_data(con: &Connection, target: &MssqlTarget, tables: &[MsTable], o: 
     let n_workers = o.parallel.max(1).min(queue.lock().unwrap().len().max(1));
     let mut handles = vec![];
     for _ in 0..n_workers {
-        let con = con.try_clone()?;
+        let con = crate::core::conn::acquire(con)?;
         let queue = queue.clone();
         let total = total.clone();
         let progress = progress.clone();
@@ -325,17 +325,20 @@ pub fn copy_data(con: &Connection, target: &MssqlTarget, tables: &[MsTable], o: 
         let batch_rows = o.batch_rows;
         handles.push(std::thread::spawn(move || -> Result<()> {
             let rt = super::runtime()?;
-            rt.block_on(async move {
+            let con_ref = &con;
+            let r = rt.block_on(async move {
                 let mut client = target.connect(&target.database).await?;
                 loop {
                     let job = { queue.lock().unwrap().pop() };
                     let Some(job) = job else { break };
                     let t = &tables[job.table];
-                    let n = copy_one(&con, &mut client, t, job.range.as_ref(), &sm, nolock, batch_rows, &progress).await.with_context(|| format!("copying {}.{}", t.schema, t.name))?;
+                    let n = copy_one(con_ref, &mut client, t, job.range.as_ref(), &sm, nolock, batch_rows, &progress).await.with_context(|| format!("copying {}.{}", t.schema, t.name))?;
                     total.fetch_add(n, Ordering::Relaxed);
                 }
                 Ok::<(), anyhow::Error>(())
-            })
+            });
+            crate::core::conn::release(con);
+            r
         }));
     }
     for h in handles { h.join().map_err(|_| anyhow::anyhow!("worker thread panicked"))??; }

@@ -141,7 +141,7 @@ pub fn load_data(con: &Connection, cat: &Catalog, target: &MssqlTarget, em: &Emi
     let n_workers = o.parallel.max(1).min(queue.lock().unwrap().len().max(1));
     let mut handles = vec![];
     for _ in 0..n_workers {
-        let con = con.try_clone()?;
+        let con = crate::core::conn::acquire(con)?;
         let queue = queue.clone();
         let total = total.clone();
         let warnings = warnings.clone();
@@ -156,7 +156,8 @@ pub fn load_data(con: &Connection, cat: &Catalog, target: &MssqlTarget, em: &Emi
         handles.push(std::thread::spawn(move || -> Result<()> {
             let rt = super::runtime()?;
             let em = Emitter::new(Flavor::Mssql, schema_map);
-            rt.block_on(async move {
+            let con_ref = &con;
+            let r = rt.block_on(async move {
                 let mut client = target.connect(&database).await?;
                 loop {
                     let job = { let mut q = queue.lock().unwrap(); q.pop() };
@@ -166,15 +167,16 @@ pub fn load_data(con: &Connection, cat: &Catalog, target: &MssqlTarget, em: &Emi
                     if let (Some(k), Some(r)) = (&job.key, &job.range) { sql.push_str(&format!(" WHERE {}", r.predicate(&quote_duck(k)))); }
                     if order_by_key { if let Some(k) = &job.key { sql.push_str(&format!(" ORDER BY {}", quote_duck(k))); } }
                     let n = match method {
-                        LoadMethod::Bulk => bulk_table(&con, &mut client, t, &sql, &em, batch_rows, &progress).await,
-                        LoadMethod::Insert => insert_table(&con, &mut client, t, &sql, &em, &progress).await,
+                        LoadMethod::Bulk => bulk_table(con_ref, &mut client, t, &sql, &em, batch_rows, &progress).await,
+                        LoadMethod::Insert => insert_table(con_ref, &mut client, t, &sql, &em, &progress).await,
                     }.with_context(|| format!("loading {}.{}", t.schema, t.name))?;
                     total.fetch_add(n, Ordering::Relaxed);
                 }
                 Ok::<(), anyhow::Error>(())
-            })?;
+            });
+            crate::core::conn::release(con);
             let _ = warnings;
-            Ok(())
+            r
         }));
     }
     for h in handles { h.join().map_err(|_| anyhow::anyhow!("worker thread panicked"))??; }

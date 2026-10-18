@@ -8,9 +8,16 @@ license = "MIT"
 [[bin]]
 name = "duckbridge"
 path = "src/main.rs"
+required-features = ["bundled"]
+
+[features]
+# The CLI bundles DuckDB. The DuckDB extension (extension/) depends on this crate with
+# default-features = false and links against the running DuckDB through the C API instead.
+default = ["bundled"]
+bundled = ["duckdb/bundled"]
 
 [dependencies]
-duckdb = { version = "1", features = ["bundled", "chrono", "uuid", "serde_json"] }
+duckdb = { version = "1.10506", default-features = false, features = ["chrono", "uuid", "serde_json"] }
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "chrono", "rust_decimal", "tds73"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }

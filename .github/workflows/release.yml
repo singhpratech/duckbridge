@@ -62,3 +62,61 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.name }}
+
+  extension:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux_amd64
+            lib: libduckbridge_ext.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux_arm64
+            lib: libduckbridge_ext.so
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: osx_arm64
+            lib: libduckbridge_ext.dylib
+          - os: macos-13
+            target: x86_64-apple-darwin
+            platform: osx_amd64
+            lib: libduckbridge_ext.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows_amd64
+            lib: duckbridge_ext.dll
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ext-${{ matrix.target }}
+          workspaces: extension
+      - name: Build extension
+        working-directory: extension
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Append DuckDB metadata footer
+        working-directory: extension
+        run: |
+          mkdir -p build
+          ./pack.sh target/${{ matrix.target }}/release/${{ matrix.lib }} build/duckbridge.duckdb_extension ${{ matrix.platform }} v1.5.6 v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          gzip -9 -c build/duckbridge.duckdb_extension > duckbridge-${{ matrix.platform }}.duckdb_extension.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckbridge-extension-${{ matrix.platform }}
+          path: extension/duckbridge-${{ matrix.platform }}.duckdb_extension.gz
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: extension/duckbridge-${{ matrix.platform }}.duckdb_extension.gz
