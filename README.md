@@ -195,7 +195,7 @@ The same engine ships as a loadable DuckDB extension (`extension/`), so everythi
 driven from inside DuckDB itself, with no CLI process:
 
 Install: download `duckbridge-<platform>.duckdb_extension.zip` for your platform from the
-[Releases](../../releases) page (`linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`,
+[Releases](https://github.com/singhpratech/duckbridge/releases) page (`linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`,
 `windows_amd64`), unzip it, and keep the file name `duckbridge.duckdb_extension`: DuckDB derives
 the extension's entry point from the file name, so a renamed file will not load. The build is
 pinned to DuckDB 1.5.6 and is not yet signed:
@@ -260,6 +260,10 @@ macOS Intel/ARM and Windows. The community-extension submission
 `SET allow_unsigned_extensions = true`.
 
 ## Build
+
+Prebuilt binaries for Linux, macOS and Windows are on the [Releases](https://github.com/singhpratech/duckbridge/releases) page. With a
+Rust toolchain, `cargo install duckbridge` builds the CLI from [crates.io](https://crates.io/crates/duckbridge)
+(the bundled DuckDB takes a few minutes to compile). From source:
 
 ```bash
 cargo build --release            # ~3 min; DuckDB is compiled in

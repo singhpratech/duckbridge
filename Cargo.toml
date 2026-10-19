@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "DuckBridge: move databases between DuckDB and SQL Server / PostgreSQL / Parquet, translate SQL between dialects, and ship results back as a restorable SQL Server .bak."
 license = "MIT"
+repository = "https://github.com/singhpratech/duckbridge"
+homepage = "https://github.com/singhpratech/duckbridge"
+documentation = "https://github.com/singhpratech/duckbridge#readme"
+readme = "README.md"
+keywords = ["duckdb", "sql-server", "mssql", "tsql", "postgresql"]
+categories = ["command-line-utilities", "database"]
+# The crate ships the library, the CLI and the translator tests; CI, shell scripts and the
+# extension/ directory (its own Cargo package) stay out of the published package.
+exclude = [".github/", "scripts/", ".gitignore", "extension/", "private/"]
 
 [[bin]]
 name = "duckbridge"
