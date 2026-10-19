@@ -253,8 +253,11 @@ after a session that used the bridge (DuckDB replays it on the next open; the br
 after each operation to keep it small). The extension is built on DuckDB's C extension API via
 `duckdb-rs`, which currently requires the *unstable* struct, so each binary is pinned to one
 DuckDB release (`v1.5.6` today, see `extension/Makefile`). CI builds Linux x86_64/arm64,
-macOS Intel/ARM and Windows. Community-extension submission (`INSTALL duckbridge FROM community`)
-is the next step; until then, load the file with `duckdb -unsigned` or `SET allow_unsigned_extensions = true`.
+macOS Intel/ARM and Windows. The community-extension submission
+([duckdb/community-extensions#3147](https://github.com/duckdb/community-extensions/pull/3147), built from
+[duckbridge-extension](https://github.com/singhpratech/duckbridge-extension)) will make it
+`INSTALL duckbridge FROM community`; until it is merged, load the file with `duckdb -unsigned` or
+`SET allow_unsigned_extensions = true`.
 
 ## Build
 
