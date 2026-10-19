@@ -30,7 +30,9 @@ use duckdb::vtab::arrow::WritableVector;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use duckdb::Connection;
 
-const DUCKDB_VERSION: &str = "v1.5.6";
+/// DuckDB release this build is pinned to (unstable C API). DuckDB's extension-ci-tools pass the
+/// target version in `DUCKDB_EXTENSION_MIN_DUCKDB_VERSION`; the local Makefile build uses the default.
+const DUCKDB_VERSION: &str = match option_env!("DUCKDB_EXTENSION_MIN_DUCKDB_VERSION") { Some(v) => v, None => "v1.5.6" };
 const VECTOR_SIZE: usize = 2048;
 
 /// Connections to the database that loaded us.
