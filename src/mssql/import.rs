@@ -1,7 +1,14 @@
 //! SQL Server -> DuckDB import: catalog from sys.* views, data streamed over TDS into DuckDB appenders,
 //! N tables (or N key ranges of one big table) in parallel.
+//!
+//! Safe reads (spec R6, see [`super::fingerprint`]): every source connection gets `LOCK_TIMEOUT`,
+//! `DEADLOCK_PRIORITY LOW` and the isolation level; each table is lock-checked and fingerprinted before
+//! its first job and fingerprinted again after its last job (on whichever worker runs them); a changed
+//! fingerprint re-reads the table, and the outcome of every table goes into a manifest.
+use super::fingerprint::{self, Fingerprint, Isolation, LockOutcome, ManifestRow, ReadSafety, SourceClient};
 use super::split::{ranges, Range};
 use super::{bracket, MsClient, MssqlTarget};
+use crate::core::runlog::{self, Failure};
 use crate::core::typemap::{mssql_to_duck, quote_duck};
 use crate::transpile::{self, Dialect};
 use anyhow::{Context, Result};
@@ -9,8 +16,9 @@ use duckdb::types::Value;
 use duckdb::Connection;
 use futures_util::TryStreamExt;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tiberius::{ColumnData, QueryItem};
 
 #[derive(Debug, Clone)]
@@ -55,14 +63,29 @@ pub struct ImportOptions {
     pub split_threshold: i64,
     pub batch_rows: usize,
     pub schema_map: HashMap<String, String>, // dbo -> main
+    /// `WITH (NOLOCK)` on the data reads (kept for 0.1.0 compatibility). It also makes the effective
+    /// isolation READ UNCOMMITTED for the session settings, the lock check and the manifest; the CLI
+    /// maps `--nolock` to `--isolation read-uncommitted`.
     pub nolock: bool,
 }
+
+/// Progress callback: (table, rows so far in the current job).
+pub type Progress = Arc<dyn Fn(&str, i64) + Send + Sync>;
 
 pub struct ImportReport {
     pub tables: usize,
     pub rows: i64,
     pub seconds: f64,
     pub warnings: Vec<String>,
+    /// One row per table (also written to `ReadSafety::manifest` when set).
+    pub manifest: Vec<ManifestRow>,
+}
+
+/// The read-safety settings actually in force: `nolock` reads are READ UNCOMMITTED whatever was asked.
+pub fn effective_safety(o: &ImportOptions, s: &ReadSafety) -> ReadSafety {
+    let mut s = s.clone();
+    if o.nolock { s.isolation = Isolation::ReadUncommitted; }
+    s
 }
 
 fn wanted(o: &ImportOptions, schema: &str, name: &str) -> bool {
@@ -72,7 +95,25 @@ fn wanted(o: &ImportOptions, schema: &str, name: &str) -> bool {
     !o.exclude.iter().any(|e| { let e = e.to_lowercase(); e == n || e == full })
 }
 
+/// [`read_catalog_with`] with the default read-safety settings.
 pub async fn read_catalog(c: &mut MsClient, o: &ImportOptions, warnings: &mut Vec<String>) -> Result<(Vec<MsTable>, Vec<MsView>)> {
+    read_catalog_with(c, o, &ReadSafety::default(), warnings).await
+}
+
+/// Read tables, keys, identities, row counts and views. Applies the session settings to `c` first, waits
+/// for the `--wait-for` gate when set, and adds the snapshot-isolation advice to `warnings`.
+pub async fn read_catalog_with(c: &mut MsClient, o: &ImportOptions, safety: &ReadSafety, warnings: &mut Vec<String>) -> Result<(Vec<MsTable>, Vec<MsView>)> {
+    let safety = effective_safety(o, safety);
+    fingerprint::apply_session_settings(c, &safety).await?;
+    if let Some(gate) = safety.wait_for.as_deref().filter(|g| !g.trim().is_empty()) {
+        runlog::note(&format!("waiting for the --wait-for gate (timeout {}s)", safety.wait_timeout_s));
+        fingerprint::wait_for(c, gate, Duration::from_secs(safety.wait_timeout_s)).await?;
+    }
+    match fingerprint::recommend_isolation(c, safety.isolation).await {
+        Ok(Some(advice)) => warnings.push(advice),
+        Ok(None) => {}
+        Err(e) => runlog::note(&format!("isolation advice unavailable: {e}")),
+    }
     let cols = c.simple_query(
         "SELECT s.name, t.name, c.name, ty.name, c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity, \
                 CAST(ISNULL(ic.seed_value, 0) AS BIGINT), CAST(ISNULL(ic.increment_value, 0) AS BIGINT), c.column_id \
@@ -278,26 +319,98 @@ pub fn create_duck_views(con: &Connection, views: &[MsView], o: &ImportOptions, 
 
 fn pending_len<T>(v: &[T]) -> usize { v.len() }
 
+#[derive(Clone)]
 struct Job {
     table: usize,
     range: Option<(String, Range)>,
 }
 
-pub fn copy_data(con: &Connection, target: &MssqlTarget, tables: &[MsTable], o: &ImportOptions, progress: Arc<dyn Fn(&str, i64) + Send + Sync>) -> Result<ImportReport> {
+/// Where a table is in its read: `Pending` (no job started in this pass), `Starting` (one worker runs the
+/// lock check and the before-fingerprint; its other jobs wait), `Running`, `Finishing` (last job done,
+/// after-fingerprint being taken), then `Done` or `Skipped`. A changed fingerprint sends it back to `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase { Pending, Starting, Running, Finishing, Done, Skipped }
+
+struct TableState {
+    phase: Phase,
+    /// Jobs of the current pass that have not finished yet.
+    pending_jobs: usize,
+    fingerprint_before: Option<Fingerprint>,
+    /// First start of the table (instant, ISO time).
+    started: Option<(Instant, String)>,
+    rereads: u32,
+    /// Rows read in the current pass.
+    rows: i64,
+}
+
+/// State shared by the import workers.
+struct Shared {
+    queue: Mutex<Vec<Job>>,
+    tables: Mutex<HashMap<usize, TableState>>,
+    /// Every job of each table, re-queued on a re-read.
+    table_jobs: HashMap<usize, Vec<Job>>,
+    abort: AtomicBool,
+    total: AtomicI64,
+    manifest: Mutex<Vec<ManifestRow>>,
+    warnings: Mutex<Vec<String>>,
+    lock_check_warned: AtomicBool,
+}
+
+/// Settings each worker needs.
+struct WorkerCfg {
+    safety: ReadSafety,
+    sm: HashMap<String, String>,
+    nolock: bool,
+    batch_rows: usize,
+}
+
+enum Pick { Run(Job, bool), Wait, Exit }
+
+fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|p| p.into_inner()) }
+
+fn now_iso() -> String { chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string() }
+
+/// Next job to run (from the end of the queue, as before), skipping tables that another worker is
+/// starting or finishing. `Run(job, true)`: this worker must start the table. Lock order: queue, tables.
+fn pick(sh: &Shared) -> Pick {
+    let mut q = lk(&sh.queue);
+    let mut st = lk(&sh.tables);
+    for k in (0..q.len()).rev() {
+        let Some(ts) = st.get_mut(&q[k].table) else { continue };
+        match ts.phase {
+            Phase::Pending => { ts.phase = Phase::Starting; return Pick::Run(q.remove(k), true); }
+            Phase::Running => return Pick::Run(q.remove(k), false),
+            _ => {}
+        }
+    }
+    if q.is_empty() && st.values().all(|t| matches!(t.phase, Phase::Done | Phase::Skipped)) { Pick::Exit } else { Pick::Wait }
+}
+
+fn is_check(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| matches!(c.downcast_ref::<Failure>(), Some(Failure::Check(_)) | Some(Failure::Guard(_))))
+}
+
+/// [`copy_data_with`] with the default read-safety settings.
+pub fn copy_data(con: &Connection, target: &MssqlTarget, tables: &[MsTable], o: &ImportOptions, progress: Progress) -> Result<ImportReport> {
+    copy_data_with(con, target, tables, o, &ReadSafety::default(), progress)
+}
+
+/// Copy every table's rows. Per table: lock check and fingerprint before its first job, fingerprint after
+/// its last job, re-read (DuckDB rows deleted, all jobs re-queued) when they differ, up to `max_rereads`.
+pub fn copy_data_with(con: &Connection, target: &MssqlTarget, tables: &[MsTable], o: &ImportOptions, safety: &ReadSafety, progress: Progress) -> Result<ImportReport> {
     let t0 = std::time::Instant::now();
-    let warnings = Arc::new(Mutex::new(Vec::<String>::new()));
-    // build jobs: big tables with a single integer key get split into ranges
+    let safety = effective_safety(o, safety);
+    // build jobs: big tables with a single integer key get split into ranges; empty tables get one job
+    // too, so they are fingerprinted and listed in the manifest
     let mut jobs: Vec<Job> = vec![];
     let rt = super::runtime()?;
     {
-        let mut c = rt.block_on(target.connect(&target.database))?;
+        let mut c = rt.block_on(SourceClient::connect(target, &target.database, &safety))?;
         for (i, t) in tables.iter().enumerate() {
-            if t.row_count == 0 { continue; }
-            let key = split_key(t);
-            if t.row_count >= o.split_threshold && o.parallel > 1 && key.is_some() {
-                let key = key.unwrap();
+            let key = split_key(t).filter(|_| t.row_count >= o.split_threshold && o.parallel > 1);
+            if let Some(key) = key {
                 let (mn, mx) = rt.block_on(async {
-                    let rows = c.simple_query(&format!("SELECT CAST(MIN({0}) AS BIGINT), CAST(MAX({0}) AS BIGINT) FROM {1}.{2}", bracket(&key), bracket(&t.schema), bracket(&t.name))).await?.into_first_result().await?;
+                    let rows = c.simple_query(format!("SELECT CAST(MIN({0}) AS BIGINT), CAST(MAX({0}) AS BIGINT) FROM {1}.{2}", bracket(&key), bracket(&t.schema), bracket(&t.name))).await?.into_first_result().await?;
                     let r = rows.first();
                     Ok::<(i64, i64), anyhow::Error>((r.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0), r.and_then(|r| r.get::<i64, _>(1)).unwrap_or(0)))
                 })?;
@@ -309,41 +422,168 @@ pub fn copy_data(con: &Connection, target: &MssqlTarget, tables: &[MsTable], o: 
         }
     }
     jobs.sort_by_key(|j| std::cmp::Reverse(tables[j.table].row_count));
-    let queue = Arc::new(Mutex::new(jobs));
-    let total = Arc::new(AtomicI64::new(0));
-    let n_workers = o.parallel.max(1).min(queue.lock().unwrap().len().max(1));
+    let mut table_jobs: HashMap<usize, Vec<Job>> = HashMap::new();
+    for j in &jobs { table_jobs.entry(j.table).or_default().push(j.clone()); }
+    let states: HashMap<usize, TableState> = table_jobs.iter().map(|(&i, js)| (i, TableState { phase: Phase::Pending, pending_jobs: js.len(), fingerprint_before: None, started: None, rereads: 0, rows: 0 })).collect();
+    let n_workers = o.parallel.max(1).min(jobs.len().max(1));
+    let shared = Arc::new(Shared {
+        queue: Mutex::new(jobs), tables: Mutex::new(states), table_jobs, abort: AtomicBool::new(false), total: AtomicI64::new(0),
+        manifest: Mutex::new(vec![]), warnings: Mutex::new(vec![]), lock_check_warned: AtomicBool::new(false),
+    });
+    let cfg = Arc::new(WorkerCfg { safety: safety.clone(), sm: o.schema_map.clone(), nolock: o.nolock, batch_rows: o.batch_rows });
+    let tables_arc: Arc<Vec<MsTable>> = Arc::new(tables.to_vec());
     let mut handles = vec![];
     for _ in 0..n_workers {
         let con = crate::core::conn::acquire(con)?;
-        let queue = queue.clone();
-        let total = total.clone();
+        let shared = shared.clone();
+        let cfg = cfg.clone();
         let progress = progress.clone();
         let target = target.clone();
-        let tables: Vec<MsTable> = tables.to_vec();
-        let sm = o.schema_map.clone();
-        let nolock = o.nolock;
-        let batch_rows = o.batch_rows;
+        let tables = tables_arc.clone();
         handles.push(std::thread::spawn(move || -> Result<()> {
-            let rt = super::runtime()?;
-            let con_ref = &con;
-            let r = rt.block_on(async move {
-                let mut client = target.connect(&target.database).await?;
-                loop {
-                    let job = { queue.lock().unwrap().pop() };
-                    let Some(job) = job else { break };
-                    let t = &tables[job.table];
-                    let n = copy_one(con_ref, &mut client, t, job.range.as_ref(), &sm, nolock, batch_rows, &progress).await.with_context(|| format!("copying {}.{}", t.schema, t.name))?;
-                    total.fetch_add(n, Ordering::Relaxed);
-                }
-                Ok::<(), anyhow::Error>(())
-            });
+            // a panicking worker must not leave the others waiting for its table
+            struct AbortOnPanic(Arc<Shared>);
+            impl Drop for AbortOnPanic { fn drop(&mut self) { if std::thread::panicking() { self.0.abort.store(true, Ordering::SeqCst); } } }
+            let _guard = AbortOnPanic(shared.clone());
+            let r = super::runtime().and_then(|rt| rt.block_on(async {
+                let mut client = SourceClient::connect(&target, &target.database, &cfg.safety).await?;
+                worker(&shared, &con, &mut client, &tables, &cfg, &progress).await
+            }));
+            if r.is_err() { shared.abort.store(true, Ordering::SeqCst); }
             crate::core::conn::release(con);
             r
         }));
     }
-    for h in handles { h.join().map_err(|_| anyhow::anyhow!("worker thread panicked"))??; }
-    let ws = warnings.lock().unwrap().clone();
-    Ok(ImportReport { tables: tables.len(), rows: total.load(Ordering::Relaxed), seconds: t0.elapsed().as_secs_f64(), warnings: ws })
+    let mut first_err: Option<anyhow::Error> = None;
+    for h in handles {
+        let r = h.join().map_err(|_| anyhow::anyhow!("worker thread panicked")).and_then(|r| r);
+        if let Err(e) = r { if first_err.is_none() { first_err = Some(e); } }
+    }
+    if let Some(e) = first_err { return Err(e); }
+    let ws = lk(&shared.warnings).clone();
+    let mut manifest = lk(&shared.manifest).clone();
+    manifest.sort_by(|a, b| a.table.cmp(&b.table));
+    if let Some(p) = &safety.manifest {
+        fingerprint::write_manifest(p, &manifest)?;
+        runlog::note(&format!("manifest written to {} and {}", p.display(), fingerprint::manifest_json_path(p).display()));
+    }
+    Ok(ImportReport { tables: tables.len(), rows: shared.total.load(Ordering::Relaxed), seconds: t0.elapsed().as_secs_f64(), warnings: ws, manifest })
+}
+
+async fn worker(sh: &Shared, con: &Connection, client: &mut SourceClient, tables: &[MsTable], cfg: &WorkerCfg, progress: &Progress) -> Result<()> {
+    loop {
+        if sh.abort.load(Ordering::SeqCst) { return Ok(()); }
+        let (job, start) = match pick(sh) {
+            Pick::Exit => return Ok(()),
+            Pick::Wait => { tokio::time::sleep(Duration::from_millis(100)).await; continue; }
+            Pick::Run(j, s) => (j, s),
+        };
+        let t = &tables[job.table];
+        if start && !start_table(sh, client, t, job.table, cfg).await? { continue; }
+        let n = copy_one(con, client, t, job.range.as_ref(), &cfg.sm, cfg.nolock, cfg.batch_rows, progress, cfg.safety.lock_timeout_ms).await.with_context(|| format!("copying {}.{}", t.schema, t.name))?;
+        let last = {
+            let mut st = lk(&sh.tables);
+            let ts = st.get_mut(&job.table).expect("table state");
+            ts.rows += n;
+            ts.pending_jobs = ts.pending_jobs.saturating_sub(1);
+            if ts.pending_jobs == 0 { ts.phase = Phase::Finishing; true } else { false }
+        };
+        if last { finish_table(sh, con, client, t, job.table, cfg).await?; }
+    }
+}
+
+/// Lock check and before-fingerprint for the first job of a table pass. Returns false when the table is
+/// skipped (its remaining jobs are dropped from the queue).
+async fn start_table(sh: &Shared, client: &mut SourceClient, t: &MsTable, idx: usize, cfg: &WorkerCfg) -> Result<bool> {
+    let name = format!("{}.{}", t.schema, t.name);
+    let safety = &cfg.safety;
+    {
+        let mut st = lk(&sh.tables);
+        let ts = st.get_mut(&idx).expect("table state");
+        if ts.started.is_none() { ts.started = Some((Instant::now(), now_iso())); }
+    }
+    let mut skipped = None;
+    if safety.lock_check {
+        match client.wait_for_unlocked(&t.schema, &t.name, safety).await {
+            Ok(LockOutcome::Clear) => {}
+            Ok(LockOutcome::Skipped(locks)) => skipped = Some(locks),
+            Err(e) if is_check(&e) => return Err(e),
+            Err(e) => {
+                let msg = format!("lock check unavailable, reading without it (the {} ms lock timeout still applies): {}", safety.lock_timeout_ms, e.root_cause());
+                runlog::note(&format!("{name}: {msg}"));
+                if !sh.lock_check_warned.swap(true, Ordering::SeqCst) { lk(&sh.warnings).push(msg); }
+            }
+        }
+    }
+    let fp = client.take(&t.schema, &t.name).await?;
+    let mut st = lk(&sh.tables);
+    let ts = st.get_mut(&idx).expect("table state");
+    if let Some(locks) = skipped {
+        ts.phase = Phase::Skipped;
+        let (started_at, started) = ts.started.clone().expect("started");
+        let rereads = ts.rereads;
+        drop(st);
+        lk(&sh.queue).retain(|j| j.table != idx);
+        let who = fingerprint::describe_locks(&locks);
+        lk(&sh.warnings).push(format!("{name}: skipped, still locked after {}s (--on-lock skip): {who}", safety.lock_wait_s));
+        let seconds = started_at.elapsed().as_secs_f64();
+        lk(&sh.manifest).push(ManifestRow { table: name.clone(), rows_read: -1, rows_source_stats: fp.rows, fingerprint_before: fp.to_string(), fingerprint_after: String::new(), started, finished: now_iso(), seconds, isolation: safety.isolation.name().into(), rereads });
+        runlog::summary_add(runlog::SummaryEntry { table: name, job: "import".into(), rows: 0, seconds, strategy: safety.isolation.name().into(), checks: vec![format!("skipped: locked by {who}")], ok: false });
+        return Ok(false);
+    }
+    ts.phase = Phase::Running;
+    ts.fingerprint_before = Some(fp);
+    ts.rows = 0;
+    ts.pending_jobs = sh.table_jobs.get(&idx).map(|j| j.len()).unwrap_or(1);
+    Ok(true)
+}
+
+/// After the last job of a table pass: compare fingerprints, then finish, re-queue or fail.
+async fn finish_table(sh: &Shared, con: &Connection, client: &mut SourceClient, t: &MsTable, idx: usize, cfg: &WorkerCfg) -> Result<()> {
+    let name = format!("{}.{}", t.schema, t.name);
+    let safety = &cfg.safety;
+    let after = client.take(&t.schema, &t.name).await?;
+    let (before, rereads, rows, (started_at, started)) = {
+        let st = lk(&sh.tables);
+        let ts = st.get(&idx).expect("table state");
+        (ts.fingerprint_before.clone().expect("fingerprint before"), ts.rereads, ts.rows, ts.started.clone().expect("started"))
+    };
+    if before == after {
+        lk(&sh.tables).get_mut(&idx).expect("table state").phase = Phase::Done;
+        sh.total.fetch_add(rows, Ordering::Relaxed);
+        let seconds = started_at.elapsed().as_secs_f64();
+        let mut checks = vec![format!("fingerprint {after}")];
+        if rereads > 0 { checks.push(format!("re-read {rereads}x")); }
+        lk(&sh.manifest).push(ManifestRow { table: name.clone(), rows_read: rows, rows_source_stats: before.rows, fingerprint_before: before.to_string(), fingerprint_after: after.to_string(), started, finished: now_iso(), seconds, isolation: safety.isolation.name().into(), rereads });
+        runlog::summary_add(runlog::SummaryEntry { table: name, job: "import".into(), rows, seconds, strategy: safety.isolation.name().into(), checks, ok: true });
+        return Ok(());
+    }
+    if rereads >= safety.max_rereads {
+        return Err(Failure::Check(format!(
+            "{name} changed while it was read ({} read(s)): before [{before}], after [{after}]. The source is still being written; read row versions with --isolation snapshot, allow more --max-rereads, or gate the import with --wait-for",
+            rereads + 1
+        )).into());
+    }
+    let msg = format!("{name}: changed during the read (before [{before}], after [{after}]); re-reading ({}/{})", rereads + 1, safety.max_rereads);
+    runlog::note(&msg);
+    eprintln!("{msg}");
+    lk(&sh.warnings).push(msg);
+    let schema = cfg.sm.get(&t.schema).cloned().unwrap_or_else(|| t.schema.clone());
+    let del = format!("DELETE FROM {}.{}", quote_duck(&schema), quote_duck(&t.name));
+    let d0 = Instant::now();
+    con.execute_batch(&del).with_context(|| format!("clearing {schema}.{} in DuckDB for a re-read", t.name))?;
+    runlog::stmt("duckdb", &name, &del, rows, d0);
+    let mut q = lk(&sh.queue);
+    let mut st = lk(&sh.tables);
+    let ts = st.get_mut(&idx).expect("table state");
+    ts.rereads += 1;
+    ts.rows = 0;
+    ts.fingerprint_before = None;
+    ts.phase = Phase::Pending;
+    let js = sh.table_jobs.get(&idx).cloned().unwrap_or_default();
+    ts.pending_jobs = js.len();
+    q.extend(js);
+    Ok(())
 }
 
 fn split_key(t: &MsTable) -> Option<String> {
@@ -355,17 +595,26 @@ fn split_key(t: &MsTable) -> Option<String> {
     t.columns.iter().find(|c| c.is_identity && int_types.contains(&c.type_name.to_lowercase().as_str())).map(|c| c.name.clone())
 }
 
-async fn copy_one(con: &Connection, client: &mut MsClient, t: &MsTable, range: Option<&(String, Range)>, sm: &HashMap<String, String>, nolock: bool, batch_rows: usize, progress: &Arc<dyn Fn(&str, i64) + Send + Sync>) -> Result<i64> {
+/// A lock timeout (1222) gets a hint; other errors pass through.
+fn lock_hint(e: anyhow::Error, t: &MsTable, lock_timeout_ms: i64) -> anyhow::Error {
+    if fingerprint::is_lock_timeout(&e) {
+        e.context(format!("{}.{}: lock timeout after {lock_timeout_ms} ms: another session holds locks on rows being read (raise --lock-timeout, or use --isolation snapshot)", t.schema, t.name))
+    } else { e }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn copy_one(con: &Connection, client: &mut SourceClient, t: &MsTable, range: Option<&(String, Range)>, sm: &HashMap<String, String>, nolock: bool, batch_rows: usize, progress: &Progress, lock_timeout_ms: i64) -> Result<i64> {
     let schema = sm.get(&t.schema).cloned().unwrap_or_else(|| t.schema.clone());
     let cols: Vec<String> = t.columns.iter().map(|c| c.select_expr.clone()).collect();
     let hint = if nolock { " WITH (NOLOCK)" } else { "" };
     let mut sql = format!("SELECT {} FROM {}.{}{hint}", cols.join(", "), bracket(&t.schema), bracket(&t.name));
     if let Some((k, r)) = range { sql.push_str(&format!(" WHERE {}", r.predicate(&bracket(k)))); }
+    let q0 = Instant::now();
     let mut app = con.appender_to_db(&t.name, &schema)?;
-    let mut stream = client.query(sql, &[]).await?;
+    let mut stream = client.query(sql.as_str(), &[]).await.map_err(|e| lock_hint(e, t, lock_timeout_ms))?;
     let mut n = 0i64;
     let mut buf: Vec<Vec<Value>> = Vec::with_capacity(batch_rows);
-    while let Some(item) = stream.try_next().await? {
+    while let Some(item) = stream.try_next().await.map_err(|e| lock_hint(e.into(), t, lock_timeout_ms))? {
         if let QueryItem::Row(row) = item {
             let vals: Vec<Value> = row.into_iter().map(column_to_value).collect();
             buf.push(vals);
@@ -381,6 +630,7 @@ async fn copy_one(con: &Connection, client: &mut MsClient, t: &MsTable, range: O
     for r in buf.drain(..) { append_values(&mut app, r)?; }
     app.flush()?;
     progress(&format!("{}.{}", t.schema, t.name), n);
+    runlog::stmt("source", &format!("{}.{}", t.schema, t.name), &sql, n, q0);
     Ok(n)
 }
 
@@ -429,4 +679,68 @@ fn append_values(app: &mut duckdb::Appender<'_>, r: Vec<Value>) -> Result<()> {
     let refs: Vec<&dyn duckdb::ToSql> = outs.iter().map(|o| o as &dyn duckdb::ToSql).collect();
     app.append_row(refs.as_slice())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared(jobs: Vec<Job>) -> Shared {
+        let mut table_jobs: HashMap<usize, Vec<Job>> = HashMap::new();
+        for j in &jobs { table_jobs.entry(j.table).or_default().push(j.clone()); }
+        let tables = table_jobs.iter().map(|(&i, js)| (i, TableState { phase: Phase::Pending, pending_jobs: js.len(), fingerprint_before: None, started: None, rereads: 0, rows: 0 })).collect();
+        Shared { queue: Mutex::new(jobs), tables: Mutex::new(tables), table_jobs, abort: AtomicBool::new(false), total: AtomicI64::new(0), manifest: Mutex::new(vec![]), warnings: Mutex::new(vec![]), lock_check_warned: AtomicBool::new(false) }
+    }
+    fn job(table: usize) -> Job { Job { table, range: None } }
+    fn phase(sh: &Shared, t: usize) -> Phase { lk(&sh.tables)[&t].phase }
+
+    #[test]
+    fn import_pick_starts_each_table_once_and_waits_for_it() {
+        // table 0 has two jobs, table 1 one; the queue pops from the end
+        let sh = shared(vec![job(0), job(0), job(1)]);
+        let Pick::Run(j, true) = pick(&sh) else { panic!("table 1 should start") };
+        assert_eq!(j.table, 1);
+        assert_eq!(phase(&sh, 1), Phase::Starting);
+        let Pick::Run(j, true) = pick(&sh) else { panic!("table 0 should start") };
+        assert_eq!(j.table, 0);
+        // table 0 is starting on another worker: its second job must wait
+        assert!(matches!(pick(&sh), Pick::Wait));
+        lk(&sh.tables).get_mut(&0).unwrap().phase = Phase::Running;
+        let Pick::Run(j, false) = pick(&sh) else { panic!("second job of table 0 runs without a start") };
+        assert_eq!(j.table, 0);
+        // queue empty but tables unfinished: wait (a re-read may re-queue jobs)
+        assert!(matches!(pick(&sh), Pick::Wait));
+        lk(&sh.tables).get_mut(&0).unwrap().phase = Phase::Done;
+        lk(&sh.tables).get_mut(&1).unwrap().phase = Phase::Skipped;
+        assert!(matches!(pick(&sh), Pick::Exit));
+    }
+
+    #[test]
+    fn import_reread_requeues_all_jobs() {
+        let sh = shared(vec![job(0), job(0)]);
+        let Pick::Run(_, true) = pick(&sh) else { panic!() };
+        lk(&sh.tables).get_mut(&0).unwrap().phase = Phase::Running;
+        let Pick::Run(_, false) = pick(&sh) else { panic!() };
+        // what finish_table does on a changed fingerprint
+        {
+            let mut q = lk(&sh.queue);
+            let mut st = lk(&sh.tables);
+            let ts = st.get_mut(&0).unwrap();
+            ts.phase = Phase::Pending;
+            ts.rereads += 1;
+            q.extend(sh.table_jobs[&0].clone());
+        }
+        assert_eq!(lk(&sh.queue).len(), 2);
+        assert!(matches!(pick(&sh), Pick::Run(_, true)));
+        assert!(matches!(pick(&sh), Pick::Wait));
+    }
+
+    #[test]
+    fn import_nolock_means_read_uncommitted() {
+        let o = ImportOptions { keys_after_load: false, include: vec![], exclude: vec![], parallel: 1, split_threshold: 1, batch_rows: 1, schema_map: HashMap::new(), nolock: true };
+        assert_eq!(effective_safety(&o, &ReadSafety::default()).isolation, Isolation::ReadUncommitted);
+        let o = ImportOptions { nolock: false, ..o };
+        let s = ReadSafety { isolation: Isolation::Snapshot, ..ReadSafety::default() };
+        assert_eq!(effective_safety(&o, &s).isolation, Isolation::Snapshot);
+    }
 }
