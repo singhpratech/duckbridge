@@ -2,6 +2,7 @@
 use super::engine::*;
 use super::tokens::*;
 use super::types::*;
+use super::{codes, semantics};
 
 pub struct R;
 
@@ -33,6 +34,7 @@ pub fn statement(st: &[Tok], ctx: &mut Ctx) -> Vec<Vec<Tok>> {
             t(&format!("-- (dropped) {}", join(st).trim().replace('\n', " ")))
         }
         "USE" => t(&format!("-- (dropped) {}", join(st).trim())),
+        "DECLARE" if v.tok(1).map(|t| t.kind != Kind::Var).unwrap_or(false) => return procedural(st, ctx), // DECLARE c CURSOR FOR ...
         "DECLARE" => return declare(&v, ctx),
         "PRINT" => fmt("SELECT {} AS message", &[&rewrite(trim(v.from(1)), &R, ctx)]),
         "BEGIN" if matches!(second.as_str(), "TRAN" | "TRANSACTION") => t("BEGIN TRANSACTION"),
@@ -67,6 +69,9 @@ pub fn statement(st: &[Tok], ctx: &mut Ctx) -> Vec<Vec<Tok>> {
         "UPDATE" => update_from(st, ctx),
         _ => rewrite(st, &R, ctx),
     };
+    // string comparison semantics (case-insensitive rewrite / trailing spaces) for queries and DML
+    let is_view = first == "CREATE" && (1..4).any(|k| v.kw(k) == "VIEW");
+    let body = if matches!(first.as_str(), "SELECT" | "WITH" | "UPDATE" | "DELETE" | "INSERT" | "MERGE") || is_view { semantics::string_compare(body, ctx) } else { body };
     out.append(&mut ctx.pre_statements);
     out.push(body);
     out
@@ -79,7 +84,7 @@ pub fn expression(toks: &[Tok], ctx: &mut Ctx) -> Vec<Tok> {
 fn procedural(st: &[Tok], ctx: &mut Ctx) -> Vec<Vec<Tok>> {
     let text = join(st).trim().to_string();
     let head: String = text.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
-    ctx.warn(format!("procedural T-SQL has no DuckDB equivalent; left as a comment: {head} ..."));
+    ctx.warn_at(codes::PROCEDURAL, &st[0], format!("procedural T-SQL has no DuckDB equivalent; left as a comment: {head} ..."));
     vec![t(&format!("/* UNTRANSLATED T-SQL (procedural):\n{}\n*/", text.replace("*/", "* /")))]
 }
 
@@ -122,8 +127,16 @@ fn declare(v: &Stmt, ctx: &mut Ctx) -> Vec<Vec<Tok>> {
             out.push(fmt(&format!("CREATE TEMP TABLE {} {{}}", quote_if_needed(&name)), &[&cols]));
             continue;
         }
-        if ds.kw(1) == "CURSOR" { ctx.warn("cursors are not supported in DuckDB"); continue; }
+        if ds.kw(1) == "CURSOR" { ctx.warn_at(codes::PROCEDURAL, ds.tok(0).unwrap(), "cursors are not supported in DuckDB; declaration dropped"); continue; }
         ctx.variables.insert(name.clone());
+        // remember the declared type for exact-arithmetic / string decisions
+        if let Some(ty) = ds.tok(1) {
+            if ty.kind == Kind::Ident && is_tsql_type(&ty.text) {
+                let mut s = ty.text.to_lowercase();
+                if ds.tok(2).map(|x| x.is_punct("(")).unwrap_or(false) { let o = ds.pos(2); s.push_str(&join(&d[o..=match_paren(d, o)]).to_lowercase()); }
+                ctx.var_types.insert(name.to_lowercase(), s);
+            }
+        }
         match d.iter().position(|t| t.is_op("=")) {
             Some(eq) => {
                 let expr = rewrite(trim(&d[eq + 1..]), &R, ctx);
@@ -337,7 +350,23 @@ impl Rules for R {
             "LOG" => if n == 2 { fmt("log({}, {})", &[arg(1), arg(0)]) } else { fmt("ln({})", &[arg(0)]) },
             "RAND" => t("random()"),
             "COUNT_BIG" => call("count"),
-            "ROUND" if n == 3 => { ctx.warn("ROUND(x, n, 1) truncation form converted to trunc"); fmt("(trunc(({}) * power(10, {})) / power(10, {}))", &[arg(0), arg(1), arg(1)]) }
+            "ROUND" if n == 3 && as_num(arg(2)).map(|z| z.trim_start_matches('0').is_empty()).unwrap_or(false) => {
+                // ROUND(x, n, 0) is ordinary rounding
+                if ctx.mssql_math { fmt("mssql_round({}, {})", &[arg(0), arg(1)]) } else { fmt("round({}, {})", &[arg(0), arg(1)]) }
+            }
+            "ROUND" if n == 3 => {
+                if ctx.mssql_math { fmt("mssql_round_trunc({}, {})", &[arg(0), arg(1)]) } else {
+                    ctx.warn_code(codes::ROUND_TRUNC, format!("ROUND({}, {}, {}) truncation converted to trunc(x * power(10, n)) / power(10, n) in DOUBLE; decimals may differ from SQL Server (use --mssql-math)", join(arg(0)), join(arg(1)), join(arg(2))));
+                    fmt("(trunc(({}) * power(10, {})) / power(10, {}))", &[arg(0), arg(1), arg(1)])
+                }
+            }
+            "ROUND" if n == 2 && ctx.mssql_math => fmt("mssql_round({}, {})", &[arg(0), arg(1)]),
+            "POWER" if n == 2 => {
+                if matches!(semantics::infer(arg(0), ctx), semantics::Ty::Dec(..) | semantics::Ty::DecAny) {
+                    ctx.warn_code(codes::POWER_DOUBLE, format!("POWER({}, {}): SQL Server returns the decimal type of the first argument (rounded to its scale), DuckDB returns DOUBLE", join(arg(0)), join(arg(1))));
+                }
+                return None;
+            }
             "ISNUMERIC" => fmt("(TRY_CAST({} AS DOUBLE) IS NOT NULL)", &[arg(0)]),
             "ISDATE" => fmt("(TRY_CAST({} AS TIMESTAMP) IS NOT NULL)", &[arg(0)]),
             "CHOOSE" => { let mut v = fmt("list_value(", &[]); for (i, x) in a.iter().skip(1).enumerate() { if i > 0 { v.extend(t(", ")); } v.extend(x.iter().cloned()); } v.extend(t(")[")); v.extend(arg(0).iter().cloned()); v.extend(t("]")); v }
@@ -384,6 +413,9 @@ impl Rules for R {
             "CONVERT" | "TRY_CONVERT" => {
                 let f = if name == "CONVERT" { "CAST" } else { "TRY_CAST" };
                 let ty = type_tokens(raw.first().map(|v| v.as_slice()).unwrap_or(&[]));
+                if name == "TRY_CONVERT" && n == 2 {
+                    if let Some(r) = try_cast_int(arg(1), &upper_text(raw.first().map(|v| v.as_slice()).unwrap_or(&[])), ctx) { return Some(r); }
+                }
                 let is_string_type = raw.first().map(|v| { let u = upper_text(v); u.starts_with("VARCHAR") || u.starts_with("NVARCHAR") || u.starts_with("CHAR") || u.starts_with("NCHAR") }).unwrap_or(false);
                 if n == 3 && is_string_type {
                     if let Some(style) = as_num(arg(2)).and_then(|s| convert_style(&s)) {
@@ -399,6 +431,9 @@ impl Rules for R {
                 let as_pos = find_top_kw(r, "AS", 0)?;
                 let expr = rewrite(trim(&r[..as_pos]), self, ctx);
                 let ty = type_tokens(trim(&r[as_pos + 1..]));
+                if name == "TRY_CAST" {
+                    if let Some(r) = try_cast_int(&expr, &upper_text(&r[as_pos + 1..]), ctx) { return Some(r); }
+                }
                 fmt(&format!("{name}({{}} AS {{}})"), &[&expr, &ty])
             }
             "FORMAT" => {
@@ -407,7 +442,14 @@ impl Rules for R {
                         let sf = dotnet_to_strftime(&f);
                         fmt(&format!("strftime({{}}, '{sf}')"), &[arg(0)])
                     }
-                    _ => { ctx.warn("FORMAT() numeric/custom formats are not translated; verify output"); fmt("format('{{}}', {})", &[arg(0)]) }
+                    Some(f) if ctx.mssql_math && pct_decimals(&f).is_some() => {
+                        fmt(&format!("mssql_format_pct({{}}, {})", pct_decimals(&f).unwrap()), &[arg(0)])
+                    }
+                    other => {
+                        let hint = if other.as_deref().and_then(pct_decimals).is_some() { " (use --mssql-math for '0.0%' formats)" } else { "" };
+                        ctx.warn_code(codes::FORMAT_NUM, format!("FORMAT({}, {}): numeric/custom .NET formats are not translated; output differs{hint}", join(arg(0)), join(arg(1))));
+                        let mut v = t("format('{}', "); v.extend(arg(0).iter().cloned()); v.push(Tok::punct(")")); v
+                    }
                 }
             }
             "STRING_SPLIT" => { if n == 3 { ctx.warn("STRING_SPLIT ordinal column not available; use unnest(...) WITH ORDINALITY manually"); } fmt("unnest(string_split({}, {}))", &[arg(0), arg(1)]) }
@@ -473,7 +515,7 @@ impl Rules for R {
             "SUBSTRING" => call("substring"),
             "ATN2" => call("atan2"),
             "CEILING" => call("ceiling"),
-            "SIGN" | "ABS" | "FLOOR" | "SQRT" | "POWER" | "EXP" | "LOG10" | "PI" | "COS" | "SIN" | "TAN" | "ACOS" | "ASIN" | "ATAN" | "DEGREES" | "RADIANS" => return None,
+            "SIGN" | "ABS" | "FLOOR" | "SQRT" | "EXP" | "LOG10" | "PI" | "COS" | "SIN" | "TAN" | "ACOS" | "ASIN" | "ATAN" | "DEGREES" | "RADIANS" => return None,
             "YEAR" | "MONTH" | "DAY" | "UPPER" | "LOWER" | "REPLACE" | "REVERSE" | "LEFT" | "RIGHT" | "CONCAT" | "CONCAT_WS" | "COALESCE" | "NULLIF" | "TRANSLATE" => return None,
             _ => return None,
         })
@@ -645,8 +687,8 @@ impl Rules for R {
             }
             i += 1;
         }
-        let _ = ctx;
-        v
+        // 5. decimal division: exact mssql_div or W-DIV-DECIMAL
+        semantics::divisions(v, ctx)
     }
 
     fn select_segment(&self, toks: Vec<Tok>, ctx: &mut Ctx) -> Vec<Tok> {
@@ -668,6 +710,34 @@ impl Rules for R {
         }
         out
     }
+}
+
+/// Number of decimals of a `FORMAT` percent pattern: '0%' -> 0, '0.0%' -> 1, '0.00%' -> 2 ...
+fn pct_decimals(f: &str) -> Option<usize> {
+    let body = f.strip_suffix('%')?;
+    match body.split_once('.') {
+        None if body == "0" => Some(0),
+        Some(("0", z)) if !z.is_empty() && z.chars().all(|c| c == '0') => Some(z.len()),
+        _ => None,
+    }
+}
+
+/// TRY_CAST / TRY_CONVERT of a string to an integer type: SQL Server gives 0 for '' and NULL for '12.5',
+/// DuckDB gives NULL and 13. `ty` is the upper-cased target type text.
+fn try_cast_int(expr: &[Tok], ty: &str, ctx: &mut Ctx) -> Option<Vec<Tok>> {
+    let base = ty.split('(').next().unwrap_or("").trim();
+    let int_like = matches!(base, "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "BIT");
+    let empty_zero = int_like || matches!(base, "FLOAT" | "REAL" | "MONEY" | "SMALLMONEY");
+    if !empty_zero { return None; }
+    let src = semantics::infer(expr, ctx);
+    if src.is_numeric() || src == semantics::Ty::Other { return None; }
+    if ctx.mssql_math && matches!(base, "INT" | "INTEGER") {
+        return Some(fmt("mssql_try_int({})", &[expr]));
+    }
+    let extra = if int_like { "; '12.5' gives NULL in SQL Server but 13 in DuckDB" } else { "" };
+    let hint = if matches!(base, "INT" | "INTEGER") { " (use --mssql-math)" } else { "" };
+    ctx.warn_code(codes::TRYCAST_EMPTY, format!("TRY_CAST({} AS {base}): '' gives 0 in SQL Server and NULL in DuckDB{extra}{hint}", join(trim(expr))));
+    None
 }
 
 fn cast_is_string(toks: &[Tok]) -> bool {

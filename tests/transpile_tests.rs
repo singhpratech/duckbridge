@@ -1,5 +1,5 @@
 //! Translator unit tests: T-SQL <-> DuckDB <-> PostgreSQL.
-use duckbridge::transpile::{translate, translate_expr, Dialect};
+use duckbridge::transpile::{codes, translate, translate_expr, translate_with, Dialect, NocaseMode, Options, TranslateError, Warning};
 use std::collections::HashMap;
 
 fn t2d(sql: &str) -> (String, Vec<String>) {
@@ -43,7 +43,8 @@ fn assert_sql(got: &str, want: &str) { assert_eq!(norm(got), norm(want), "\n got
     assert_sql(&t2d("SELECT first + ' ' + last, a + b, 'x' + CAST(n AS VARCHAR) FROM t").0,
         "SELECT first || ' ' || last, a + b, 'x' || CAST(n AS VARCHAR) FROM t;");
 }
-#[test] fn nstrings() { assert_sql(&t2d("SELECT N'héllo' FROM t WHERE x = N'a''b'").0, "SELECT 'héllo' FROM t WHERE x = 'a''b';"); }
+// 0.1.1: the default nocase mode is Rewrite, so `x = 'lit'` becomes a case/trailing-space-insensitive comparison
+#[test] fn nstrings() { assert_sql(&t2d("SELECT N'héllo' FROM t WHERE x = N'a''b'").0, "SELECT 'héllo' FROM t WHERE lower(rtrim(x, ' ')) = lower('a''b');"); }
 #[test] fn declare_set_variables() {
     assert_sql(&t2d("DECLARE @n INT = 5, @s NVARCHAR(10); SET @s = 'x'; SELECT * FROM t WHERE a = @n AND b = @s").0,
         "SET VARIABLE n = 5; SET VARIABLE s = NULL; SET VARIABLE s = 'x'; SELECT * FROM t WHERE a = getvariable('n') AND b = getvariable('s');");
@@ -82,12 +83,17 @@ fn assert_sql(got: &str, want: &str) { assert_eq!(norm(got), norm(want), "\n got
     assert_sql(&r.sql, "SELECT 1 WHERE x LIKE 'a%';");
 }
 #[test] fn prelude_emitted() {
+    // 0.1.1: default nocase mode is Rewrite -> no global collation in the prelude (3 SET lines)
     let o = duckbridge::transpile::Options::default();
     let r = duckbridge::transpile::translate_with("SELECT 7 / 2", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &o).unwrap();
     assert!(r.sql.contains("SET integer_division = true;"), "{}", r.sql);
     assert!(r.sql.contains("NULLS_FIRST_ON_ASC_LAST_ON_DESC"));
-    assert!(r.sql.contains("default_collation = 'nocase'"));
+    assert!(!r.sql.contains("default_collation"));
+    assert_eq!(r.sql.lines().filter(|l| l.starts_with("SET ")).count(), 3);
     assert!(r.sql.trim_end().ends_with("SELECT 7 / 2;"));
+    let g = duckbridge::transpile::Options { nocase_mode: Some(NocaseMode::Global), ..Default::default() };
+    let r = duckbridge::transpile::translate_with("SELECT 7 / 2", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &g).unwrap();
+    assert!(r.sql.contains("default_collation = 'nocase'"), "{}", r.sql);
 }
 #[test] fn sql2022_functions_to_duck() {
     assert_sql(&t2d("SELECT DATE_BUCKET(day, 7, d), GREATEST(a, b), DATETRUNC(month, d), REGEXP_LIKE(s, '^a'), JSON_OBJECT('k': v, 'n': 1), STRING_SPLIT(s, ',') FROM t").0,
@@ -139,3 +145,197 @@ fn assert_sql(got: &str, want: &str) { assert_eq!(norm(got), norm(want), "\n got
 #[test] fn duck_to_pg_types() { assert_sql(&d2p("CREATE TABLE t (a UTINYINT, b DOUBLE, c BLOB, d TIMESTAMPTZ, e JSON, f VARCHAR, g DECIMAL(10,2))"), "CREATE TABLE t (a smallint, b double precision, c bytea, d timestamp with time zone, e jsonb, f text, g DECIMAL(10,2));"); }
 #[test] fn pg_to_duck_basics() { assert_sql(&p2d("SELECT to_char(d, 'YYYY-MM-DD'), string_to_array(s, ','), ARRAY[1,2], x::bytea FROM t FOR UPDATE"), "SELECT strftime(d, '%Y-%m-%d'), string_split(s, ','), [1,2], x::BLOB FROM t;"); }
 #[test] fn tsql_to_pg_chain() { assert_sql(&translate("SELECT TOP 3 ISNULL(a, 0), GETDATE() FROM dbo.t", Dialect::Tsql, Dialect::Postgres, &HashMap::from([("dbo".to_string(), "public".to_string())])).unwrap().sql, "SELECT COALESCE(a, 0), now() FROM public.t LIMIT 3;"); }
+
+// ------------------------------------------------------------------ 0.1.1 (R7): coded warnings, nocase modes, strict, exact math
+fn opts() -> Options { Options { prelude: false, ..Default::default() } }
+fn t2d_with(sql: &str, o: &Options) -> (String, Vec<Warning>) {
+    let r = translate_with(sql, Dialect::Tsql, Dialect::DuckDb, &HashMap::from([("dbo".to_string(), "main".to_string())]), o).unwrap();
+    assert_eq!(r.warnings, r.diagnostics.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+    (r.sql, r.diagnostics)
+}
+fn typed(pairs: &[(&str, &str)]) -> Options { Options { types: pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..opts() } }
+fn codes_of(w: &[Warning]) -> Vec<&'static str> { w.iter().map(|x| x.code).collect() }
+fn has(w: &[Warning], code: &str) -> bool { w.iter().any(|x| x.code == code) }
+
+#[test] fn warning_display_and_position() {
+    let (_, w) = t2d_with("SELECT a\nFROM t WHERE x = ROUND(y, 2, 1)", &opts());
+    let r = w.iter().find(|x| x.code == codes::ROUND_TRUNC).expect("W-ROUND-TRUNC");
+    assert_eq!((r.line, r.col), (2, 18));
+    assert!(r.to_string().starts_with("W-ROUND-TRUNC (line 2:18): ROUND(y, 2, 1)"), "{r}");
+    let w0 = Warning { code: codes::DIV_DECIMAL, line: 12, col: 8, message: "m".into() };
+    assert_eq!(w0.to_string(), "W-DIV-DECIMAL (line 12:8): m");
+}
+#[test] fn generic_code_for_free_text() {
+    let (_, w) = t2d_with("SELECT 1;\nSET NOCOUNT ON", &opts());
+    assert_eq!(codes_of(&w), vec![codes::GENERIC]);
+    assert_eq!((w[0].line, w[0].col), (2, 1));
+}
+#[test] fn w_div_decimal() {
+    // literal arithmetic: SQL Server types 7 * 1.0 / 3 as numeric(9,6)
+    let (s, w) = t2d_with("SELECT 7 * 1.0 / 3", &opts());
+    assert_sql(&s, "SELECT 7 * 1.0 / 3;");
+    let d = w.iter().find(|x| x.code == codes::DIV_DECIMAL).unwrap();
+    assert!(d.message.contains("numeric(9,6)"), "{d}");
+    assert_eq!((d.line, d.col), (1, 16));
+    // typed int columns: numeric(24,12)
+    let (_, w) = t2d_with("SELECT qty * 1.0 / cnt FROM t", &typed(&[("qty", "int"), ("cnt", "int")]));
+    assert!(w.iter().any(|x| x.code == codes::DIV_DECIMAL && x.message.contains("numeric(24,12)")), "{w:?}");
+    // unknown operand types with decimal evidence
+    let (_, w) = t2d_with("SELECT a * 1.0 / b FROM t", &opts());
+    assert!(w.iter().any(|x| x.code == codes::DIV_DECIMAL && x.message.contains("--types")), "{w:?}");
+    // integer division and float division are faithful: no warning
+    assert!(t2d_with("SELECT a / b, 7 / 2, CAST(a AS FLOAT) / 3 FROM t", &opts()).1.is_empty());
+    // column types from CREATE TABLE in the same script
+    let (_, w) = t2d_with("CREATE TABLE t (amt DECIMAL(10,2), n INT); SELECT amt / n FROM t", &opts());
+    assert!(w.iter().any(|x| x.code == codes::DIV_DECIMAL && x.message.contains("numeric(21,13)")), "{w:?}");
+}
+#[test] fn w_round_trunc_and_round_zero() {
+    let (s, w) = t2d_with("SELECT ROUND(x, 2, 1), ROUND(x, 2, 0) FROM t", &opts());
+    assert_sql(&s, "SELECT (trunc((x) * power(10, 2)) / power(10, 2)), round(x, 2) FROM t;");
+    assert_eq!(codes_of(&w), vec![codes::ROUND_TRUNC]);
+}
+#[test] fn w_format_num() {
+    let (s, w) = t2d_with("SELECT FORMAT(x, 'N2'), FORMAT(y, '0.0%'), FORMAT(d, 'yyyy') FROM t", &opts());
+    assert_sql(&s, "SELECT format('{}', x), format('{}', y), strftime(d, '%Y') FROM t;");
+    assert_eq!(w.iter().filter(|x| x.code == codes::FORMAT_NUM).count(), 2);
+    assert!(w.iter().any(|x| x.message.contains("--mssql-math")));
+}
+#[test] fn w_trycast_empty() {
+    let (s, w) = t2d_with("SELECT TRY_CAST(s AS INT), TRY_CONVERT(BIGINT, s), TRY_CAST(s AS DATE), TRY_CAST(n AS INT) FROM t", &typed(&[("n", "decimal(10,2)")]));
+    assert_sql(&s, "SELECT TRY_CAST(s AS INTEGER), TRY_CAST(s AS BIGINT), TRY_CAST(s AS DATE), TRY_CAST(n AS INTEGER) FROM t;");
+    assert_eq!(w.iter().filter(|x| x.code == codes::TRYCAST_EMPTY).count(), 2, "{w:?}");
+}
+#[test] fn w_procedural() {
+    let (s, w) = t2d_with("WHILE @i < 10 SET @i = @i + 1", &opts());
+    assert!(s.starts_with("/* UNTRANSLATED"));
+    assert_eq!(codes_of(&w), vec![codes::PROCEDURAL]);
+    let (_, w) = t2d_with("DECLARE c CURSOR FOR SELECT 1; DECLARE @c CURSOR", &opts());
+    assert!(has(&w, codes::PROCEDURAL), "{w:?}");
+    let (_, w) = t2d_with("EXEC('SELECT 1')", &opts());
+    assert!(has(&w, codes::PROCEDURAL));
+}
+#[test] fn w_power_double() {
+    let (_, w) = t2d_with("SELECT POWER(2.5, 2), POWER(amount, 2), POWER(n, 2) FROM t", &typed(&[("amount", "decimal(18,2)"), ("n", "int")]));
+    assert_eq!(w.iter().filter(|x| x.code == codes::POWER_DOUBLE).count(), 2, "{w:?}");
+}
+#[test] fn nocase_rewrite_literal_comparisons() {
+    let (s, w) = t2d_with("SELECT * FROM t WHERE name = 'Lit' AND 'Abc' = t.code AND s <> 'X  ' AND st IN ('A', 'b') AND k NOT IN ('Q') AND zip = '12345' AND d = '2024-01-01'", &opts());
+    assert_sql(&s, "SELECT * FROM t WHERE lower(rtrim(name, ' ')) = lower('Lit') AND lower('Abc') = lower(rtrim(t.code, ' ')) AND lower(rtrim(s, ' ')) <> lower('X') \
+        AND lower(rtrim(st, ' ')) IN (lower('A'), lower('b')) AND lower(rtrim(k, ' ')) NOT IN (lower('Q')) AND zip = '12345' AND d = '2024-01-01';");
+    assert!(w.is_empty(), "{w:?}");
+    // CASE WHEN, JOIN ON and subqueries are predicates too; SET/VALUES/SELECT-list assignments are not
+    let (s, _) = t2d_with("UPDATE t SET name = 'New' WHERE kind = 'Old'", &opts());
+    assert_sql(&s, "UPDATE t SET name = 'New' WHERE lower(rtrim(kind, ' ')) = lower('Old');");
+    let (s, _) = t2d_with("SELECT CASE WHEN c = 'Y' THEN 'yes' END FROM a JOIN b ON b.k = 'K' WHERE EXISTS (SELECT 1 FROM u WHERE u.n = 'N')", &opts());
+    assert_sql(&s, "SELECT CASE WHEN lower(rtrim(c, ' ')) = lower('Y') THEN 'yes' END FROM a JOIN b ON lower(rtrim(b.k, ' ')) = lower('K') WHERE EXISTS (SELECT 1 FROM u WHERE lower(rtrim(u.n, ' ')) = lower('N'));");
+    let (s, _) = t2d_with("INSERT INTO t (a) VALUES ('X'); SELECT COALESCE(a, 'Z') AS a FROM t", &opts());
+    assert_sql(&s, "INSERT INTO t (a) VALUES ('X'); SELECT COALESCE(a, 'Z') AS a FROM t;");
+    // explicit COLLATE and numeric columns are left alone
+    let (s, w) = t2d_with("SELECT 1 FROM t WHERE n = 'x' COLLATE Latin1_General_CI_AS AND id = 'abc'", &typed(&[("id", "int")]));
+    assert_sql(&s, "SELECT 1 FROM t WHERE n = 'x' COLLATE NOCASE AND id = 'abc';");
+    assert_eq!(codes_of(&w), vec![codes::TRAILING_SPACE]);
+    // non-atomic operands are reported, never mangled
+    let (s, w) = t2d_with("SELECT 1 FROM t WHERE CASE WHEN a = 1 THEN 'x' END = 'x' AND b + 'x' = 'yx'", &opts());
+    assert_sql(&s, "SELECT 1 FROM t WHERE CASE WHEN a = 1 THEN 'x' END = 'x' AND b || 'x' = 'yx';");
+    assert_eq!(codes_of(&w), vec![codes::CI_COMPARE, codes::TRAILING_SPACE]);
+    // views read from SQL Server get the same treatment
+    let (s, _) = t2d_with("CREATE VIEW v AS SELECT * FROM t WHERE status = 'Active'", &opts());
+    assert_sql(&s, "CREATE VIEW v AS SELECT * FROM t WHERE lower(rtrim(status, ' ')) = lower('Active');");
+}
+#[test] fn nocase_rewrite_executes_like_sql_server() {
+    let (s, _) = t2d_with("SELECT count(*) FROM t WHERE name = 'ALICE' OR name IN ('bob')", &opts());
+    let con = duckdb::Connection::open_in_memory().unwrap();
+    con.execute_batch("CREATE TABLE t (name VARCHAR); INSERT INTO t VALUES ('Alice'), ('alice  '), ('Bob'), ('carol')").unwrap();
+    let n: i64 = con.query_row(s.trim_end_matches(';'), [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 3); // SQL Server (CI_AS): 'Alice', 'alice  ' and 'Bob'
+}
+#[test] fn w_ci_compare_not_rewritten() {
+    let o = typed(&[("name", "varchar(50)"), ("city", "nvarchar(20)")]);
+    let (s, w) = t2d_with("SELECT DISTINCT name FROM t", &o);
+    assert_sql(&s, "SELECT DISTINCT name FROM t;");
+    assert_eq!(codes_of(&w), vec![codes::CI_COMPARE]);
+    let (_, w) = t2d_with("SELECT city, count(*) FROM t GROUP BY city", &o);
+    assert_eq!(codes_of(&w), vec![codes::CI_COMPARE]);
+    let (_, w) = t2d_with("SELECT * FROM a JOIN b ON a.name = b.name WHERE a.name > 'M'", &o);
+    assert!(has(&w, codes::CI_COMPARE) && has(&w, codes::TRAILING_SPACE), "{w:?}");
+    assert_eq!(w.iter().filter(|x| x.code == codes::CI_COMPARE).count(), 1, "once per statement: {w:?}");
+    let (_, w) = t2d_with("SELECT CASE status WHEN 'Open' THEN 1 END FROM t", &opts());
+    assert_eq!(codes_of(&w), vec![codes::CI_COMPARE]);
+    // Off mode: binary semantics on purpose, only the trailing-space note
+    let off = Options { nocase_mode: Some(NocaseMode::Off), ..o.clone() };
+    let (s, w) = t2d_with("SELECT DISTINCT name FROM t WHERE city = 'Paris'", &off);
+    assert_sql(&s, "SELECT DISTINCT name FROM t WHERE city = 'Paris';");
+    assert_eq!(codes_of(&w), vec![codes::TRAILING_SPACE]);
+}
+#[test] fn w_trailing_space() {
+    let (s, w) = t2d_with("SELECT 1 FROM t WHERE code = '123'", &typed(&[("code", "char(10)")]));
+    assert_sql(&s, "SELECT 1 FROM t WHERE code = '123';");
+    assert_eq!(codes_of(&w), vec![codes::TRAILING_SPACE]);
+    let g = Options { nocase_mode: Some(NocaseMode::Global), ..opts() };
+    let (s, w) = t2d_with("SELECT 1 FROM t WHERE x = 'abc'", &g);
+    assert_sql(&s, "SELECT 1 FROM t WHERE x = 'abc';");
+    assert_eq!(codes_of(&w), vec![codes::TRAILING_SPACE]);
+}
+#[test] fn legacy_nocase_flag_maps_to_modes() {
+    assert_eq!(Options::default().nocase_mode(), NocaseMode::Rewrite);
+    assert_eq!(Options { nocase: false, ..Default::default() }.nocase_mode(), NocaseMode::Off);
+    assert_eq!(Options { nocase: false, nocase_mode: Some(NocaseMode::Global), ..Default::default() }.nocase_mode(), NocaseMode::Global);
+    assert_eq!(NocaseMode::parse("REWRITE"), Some(NocaseMode::Rewrite));
+    assert_eq!(duckbridge::transpile::duckdb_prelude_for(NocaseMode::Rewrite).len(), 3);
+    assert_eq!(duckbridge::transpile::duckdb_prelude_for(NocaseMode::Off).len(), 3);
+    assert_eq!(duckbridge::transpile::duckdb_prelude_for(NocaseMode::Global).len(), 4);
+    assert_eq!(duckbridge::transpile::duckdb_prelude(true).len(), 4); // legacy bool = Global
+    let t = duckbridge::transpile::parse_types("Amount=decimal(18,4), qty=int;t.name:varchar(20)");
+    assert_eq!(t.get("amount").map(|s| s.as_str()), Some("decimal(18,4)"));
+    assert_eq!(t.get("qty").map(|s| s.as_str()), Some("int"));
+    assert_eq!(t.get("t.name").map(|s| s.as_str()), Some("varchar(20)"));
+}
+#[test] fn strict_mode() {
+    let st = Options { strict: true, ..opts() };
+    let e = translate_with("SELECT 1;\nSELECT 7 * 1.0 / 3;\nSET NOCOUNT ON", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &st).unwrap_err();
+    match &e {
+        TranslateError::Strict(ws) => {
+            assert_eq!(codes_of(ws), vec![codes::DIV_DECIMAL, codes::GENERIC]);
+            assert_eq!(ws[0].line, 2);
+        }
+        other => panic!("{other:?}"),
+    }
+    let text = e.to_string();
+    assert!(text.starts_with("strict mode: 2 translation warning(s):\nW-DIV-DECIMAL (line 2:"), "{text}");
+    assert_eq!(text.lines().count(), 3);
+    // clean scripts pass
+    assert!(translate_with("SELECT a FROM t WHERE id = 1", Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &st).is_ok());
+}
+#[test] fn mssql_math_rewrites_and_runs() {
+    let o = Options { mssql_math: true, ..Default::default() };
+    let sql = "CREATE TABLE t (qty INT, cnt INT, price DECIMAL(10,3), s VARCHAR(10));\n\
+               INSERT INTO t VALUES (10, 4, 2.567, ''), (7, 3, -2.567, '12.5');\n\
+               SELECT qty * 1.0 / cnt AS r, ROUND(price, 2, 1) AS tr, ROUND(price, 2) AS rd, TRY_CAST(s AS INT) AS ti, FORMAT(qty * 1.0 / cnt / 100, '0.0%') AS pct, 7 * 1.0 / 3 AS lit FROM t ORDER BY qty DESC";
+    let r = translate_with(sql, Dialect::Tsql, Dialect::DuckDb, &HashMap::new(), &o).unwrap();
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert!(r.sql.contains("CREATE OR REPLACE MACRO mssql_div("), "macros in the prelude");
+    assert!(r.sql.contains("CAST(mssql_div(CAST(qty * 1.0 AS DECIMAL(13,1)), CAST(cnt AS DECIMAL(10,0)), 24, 12) AS DECIMAL(24,12))"), "{}", r.sql);
+    assert!(r.sql.contains("CAST(mssql_div(CAST(7 * 1.0 AS DECIMAL(4,1)), CAST(3 AS DECIMAL(1,0)), 9, 6) AS DECIMAL(9,6))"), "{}", r.sql);
+    assert!(r.sql.contains("mssql_round_trunc(price, 2)") && r.sql.contains("mssql_round(price, 2)") && r.sql.contains("mssql_try_int(s)") && r.sql.contains("mssql_format_pct("), "{}", r.sql);
+    let con = duckdb::Connection::open_in_memory().unwrap();
+    let stmts: Vec<String> = duckbridge::transpile::tokens::statements(&duckbridge::transpile::tokens::tokenize(&r.sql, false))
+        .iter().map(|s| duckbridge::transpile::tokens::join(s).trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let (last, init) = stmts.split_last().unwrap();
+    for s in init { con.execute_batch(s).unwrap(); }
+    let mut st = con.prepare(&format!("SELECT CAST(r AS VARCHAR), CAST(tr AS VARCHAR), CAST(rd AS VARCHAR), COALESCE(CAST(ti AS VARCHAR), 'NULL'), pct, CAST(lit AS VARCHAR) FROM ({last}) ORDER BY r DESC")).unwrap();
+    let rows: Vec<Vec<String>> = st.query_map([], |row| (0..6).map(|i| row.get::<_, String>(i)).collect()).unwrap().map(|x| x.unwrap()).collect();
+    // SQL Server 2019: CAST(10 AS int)*1.0/CAST(4 AS int) = 2.500000000000; ROUND(2.567,2,1) = 2.560; ROUND(2.567,2) = 2.570;
+    // TRY_CAST('' AS int) = 0; FORMAT(0.025, '0.0%') = 2.5%; 7*1.0/3 = 2.333333; 7*1.0/3 (int columns) = 2.333333333333;
+    // ROUND(-2.567,2,1) = -2.560; ROUND(-2.567,2) = -2.570; TRY_CAST('12.5' AS int) = NULL; FORMAT(0.023333333333333, '0.0%') = 2.3%
+    assert_eq!(rows[0], ["2.500000000000", "2.560", "2.570", "0", "2.5%", "2.333333"]);
+    assert_eq!(rows[1], ["2.333333333333", "-2.560", "-2.570", "NULL", "2.3%", "2.333333"]);
+}
+#[test] fn mssql_math_needs_types_for_division() {
+    let o = Options { mssql_math: true, ..opts() };
+    let (s, w) = t2d_with("SELECT a * 1.0 / b FROM t", &o);
+    assert_sql(&s, "SELECT a * 1.0 / b FROM t;");
+    assert!(w.iter().any(|x| x.code == codes::DIV_DECIMAL && x.message.contains("mssql_div needs")), "{w:?}");
+    let (s, w) = t2d_with("SELECT a * 1.0 / b FROM t", &Options { types: HashMap::from([("a".into(), "bigint".into()), ("b".into(), "bigint".into())]), ..o });
+    assert_sql(&s, "SELECT CAST(mssql_div(CAST(a * 1.0 AS DECIMAL(22,1)), CAST(b AS DECIMAL(19,0)), 38, 17) AS DECIMAL(38,17)) FROM t;");
+    assert!(w.is_empty());
+}

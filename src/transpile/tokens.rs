@@ -14,16 +14,28 @@ pub enum Kind {
     Punct,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A token. `line`/`col` (1-based) locate it in the source script; tokens synthesised by the
+/// rewriter have `line == 0`. Positions are not part of token equality.
+#[derive(Debug, Clone)]
 pub struct Tok {
     pub kind: Kind,
     pub text: String,
+    pub line: usize,
+    pub col: usize,
 }
+
+impl PartialEq for Tok {
+    fn eq(&self, o: &Tok) -> bool { self.kind == o.kind && self.text == o.text }
+}
+impl Eq for Tok {}
 
 impl Tok {
     pub fn new(kind: Kind, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into() }
+        Self { kind, text: text.into(), line: 0, col: 0 }
     }
+    /// Same token placed at a source position.
+    pub fn at(mut self, line: usize, col: usize) -> Self { self.line = line; self.col = col; self }
+    pub fn has_pos(&self) -> bool { self.line > 0 }
     pub fn ident(s: &str) -> Self { Tok::new(Kind::Ident, s) }
     pub fn op(s: &str) -> Self { Tok::new(Kind::Op, s) }
     pub fn punct(s: &str) -> Self { Tok::new(Kind::Punct, s) }
@@ -76,7 +88,12 @@ pub fn tokenize(sql: &str, bracket_idents: bool) -> Vec<Tok> {
     let n = b.len();
     let mut out = Vec::new();
     let mut i = 0;
-    let push = |out: &mut Vec<Tok>, k: Kind, s: &str| out.push(Tok::new(k, s));
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let mut push = |out: &mut Vec<Tok>, k: Kind, s: &str| {
+        out.push(Tok::new(k, s).at(line, col));
+        for ch in s.chars() { if ch == '\n' { line += 1; col = 1; } else { col += 1; } }
+    };
     while i < n {
         let c = b[i];
         let start = i;

@@ -1,11 +1,17 @@
 //! Generic recursive rewriter. Dialect pairs plug in a `Rules` implementation.
 use super::tokens::*;
+use super::{codes, NocaseMode, Warning};
 use std::collections::{HashMap, HashSet};
 
 pub struct Ctx {
     pub schema_map: HashMap<String, String>,
-    warnings: Vec<String>,
-    seen: HashSet<String>,
+    warnings: Vec<Warning>,
+    seen: HashSet<(String, String)>,
+    /// Codes already reported for the current statement (for once-per-statement warnings).
+    stmt_codes: HashSet<&'static str>,
+    /// Source position of the token being rewritten (0 when unknown).
+    pub cur_line: usize,
+    pub cur_col: usize,
     /// Names declared as temp tables / table variables in this script (unprefixed).
     pub temp_tables: HashSet<String>,
     /// Scalar variables declared in this script (without '@').
@@ -16,23 +22,61 @@ pub struct Ctx {
     pub in_ddl: bool,
     /// SQL Server target version for T-SQL output: 2019, 2022 or 2025.
     pub target_version: u16,
-    /// Assume SQL Server's case-insensitive default collation (T-SQL LIKE -> ILIKE, nocase prelude).
+    /// Assume SQL Server's case-insensitive default collation (T-SQL LIKE -> ILIKE).
     pub nocase: bool,
+    /// How SQL Server's case-insensitive comparisons are reproduced in DuckDB.
+    pub nocase_mode: NocaseMode,
     /// Rewrite DuckDB `/` as float division in T-SQL (DuckDB `/` is always floating point).
     pub float_division: bool,
+    /// Emit the mathcompat macros (mssql_div, mssql_round_trunc, mssql_try_int, ...) for exact SQL Server arithmetic.
+    pub mssql_math: bool,
+    /// Lower-case column name (or `table.column`) -> SQL Server type, e.g. "decimal(18,4)".
+    pub types: HashMap<String, String>,
+    /// Declared scalar variable types (name without '@', lower case) -> SQL Server type.
+    pub var_types: HashMap<String, String>,
 }
 
 impl Ctx {
     pub fn new(schema_map: HashMap<String, String>) -> Self {
-        Self { schema_map, warnings: vec![], seen: HashSet::new(), temp_tables: HashSet::new(), variables: HashSet::new(), pre_statements: vec![], in_ddl: false, target_version: 2019, nocase: true, float_division: true }
-    }
-    pub fn warn(&mut self, msg: impl Into<String>) {
-        let m = msg.into();
-        if self.seen.insert(m.clone()) {
-            self.warnings.push(m);
+        Self {
+            schema_map, warnings: vec![], seen: HashSet::new(), stmt_codes: HashSet::new(), cur_line: 0, cur_col: 0,
+            temp_tables: HashSet::new(), variables: HashSet::new(), pre_statements: vec![], in_ddl: false, target_version: 2019,
+            nocase: true, nocase_mode: NocaseMode::Rewrite, float_division: true, mssql_math: false, types: HashMap::new(), var_types: HashMap::new(),
         }
     }
-    pub fn take_warnings(&mut self) -> Vec<String> {
+    /// Free-text warning (code W-GENERIC) at the current position.
+    pub fn warn(&mut self, msg: impl Into<String>) {
+        self.warn_code(codes::GENERIC, msg);
+    }
+    /// Coded warning at the current position.
+    pub fn warn_code(&mut self, code: &'static str, msg: impl Into<String>) {
+        let (l, c) = (self.cur_line, self.cur_col);
+        self.push_warning(code, l, c, msg.into());
+    }
+    /// Coded warning at the position of `tok` (falls back to the current position for synthesised tokens).
+    pub fn warn_at(&mut self, code: &'static str, tok: &Tok, msg: impl Into<String>) {
+        let (l, c) = if tok.has_pos() { (tok.line, tok.col) } else { (self.cur_line, self.cur_col) };
+        self.push_warning(code, l, c, msg.into());
+    }
+    /// Coded warning reported at most once per statement (per code).
+    pub fn warn_stmt_once(&mut self, code: &'static str, tok: &Tok, msg: impl Into<String>) {
+        if self.stmt_codes.insert(code) { self.warn_at(code, tok, msg); }
+    }
+    fn push_warning(&mut self, code: &'static str, line: usize, col: usize, message: String) {
+        if self.seen.insert((code.to_string(), message.clone())) {
+            self.warnings.push(Warning { code, line, col, message });
+        }
+    }
+    /// Remember the source position of `tok` as the current position (ignored for synthesised tokens).
+    pub fn set_pos(&mut self, tok: &Tok) {
+        if tok.has_pos() { self.cur_line = tok.line; self.cur_col = tok.col; }
+    }
+    /// Start a new statement: resets the once-per-statement bookkeeping.
+    pub fn begin_statement(&mut self, first: Option<&Tok>) {
+        self.stmt_codes.clear();
+        if let Some(t) = first { self.set_pos(t); }
+    }
+    pub fn take_warnings(&mut self) -> Vec<Warning> {
         self.seen.clear();
         std::mem::take(&mut self.warnings)
     }
@@ -90,14 +134,16 @@ pub fn rewrite(toks: &[Tok], rules: &dyn Rules, ctx: &mut Ctx) -> Vec<Tok> {
             if is_func {
                 let k = fname_idx.unwrap();
                 let name = out[k].text.clone();
+                let name_tok = out[k].clone();
                 // drop the name (and trailing trivia) from out; rules decide how to render the call
                 out.truncate(k);
                 let raw_args: Vec<Vec<Tok>> = if inner.iter().all(|x| x.is_trivia()) { vec![] } else { split_top(inner, ",") };
                 let args: Vec<Vec<Tok>> = raw_args.iter().map(|a| rewrite_arg(a, rules, ctx)).collect();
+                ctx.set_pos(&name_tok);
                 match rules.func(&name.to_uppercase(), &raw_args, &args, ctx) {
                     Some(rep) => out.extend(rep),
                     None => {
-                        out.push(Tok::ident(&name));
+                        out.push(Tok::ident(&name).at(name_tok.line, name_tok.col));
                         out.push(Tok::punct("("));
                         for (ai, a) in args.iter().enumerate() {
                             if ai > 0 { out.push(Tok::punct(",")); out.push(Tok::ws()); }
@@ -118,6 +164,7 @@ pub fn rewrite(toks: &[Tok], rules: &dyn Rules, ctx: &mut Ctx) -> Vec<Tok> {
         }
         let prev = prev_sig(&out, out.len()).map(|k| out[k].clone());
         let next = next_sig(toks, i + 1).map(|k| toks[k].clone());
+        ctx.set_pos(t);
         out.extend(rules.token(t, prev.as_ref(), next.as_ref(), ctx));
         i += 1;
     }
