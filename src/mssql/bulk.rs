@@ -40,11 +40,15 @@ pub struct BulkOptions {
     /// these columns and `INSERT BULK ... ORDER (...)` tells SQL Server so. Only for keys whose
     /// order is the same in both engines (integers, dates); text collations may differ.
     pub order_by: Option<String>,
+    /// `CHECK_CONSTRAINTS`: evaluate CHECK and FOREIGN KEY constraints while loading. Without it SQL Server
+    /// marks them *not trusted* afterwards, and a staging table's partition CHECK can no longer prove
+    /// containment for `ALTER TABLE ... SWITCH` (error 4972). Default on.
+    pub check_constraints: bool,
 }
 
 impl Default for BulkOptions {
     fn default() -> Self {
-        BulkOptions { batch_rows: 100_000, keep_identity: false, table_lock: true, prefetch_batches: 4, order_by: None }
+        BulkOptions { batch_rows: 100_000, keep_identity: false, table_lock: true, prefetch_batches: 4, order_by: None, check_constraints: true }
     }
 }
 
@@ -105,6 +109,7 @@ pub async fn bulk_load(con: &Connection, client: &mut MsClient, table_ref: &str,
     let mut opts = SqlBulkCopyOptions::empty();
     if o.keep_identity { opts |= SqlBulkCopyOption::KeepIdentity; }
     if o.table_lock { opts |= SqlBulkCopyOption::TableLock; }
+    if o.check_constraints { opts |= SqlBulkCopyOption::CheckConstraints; }
     let label = format!("INSERT BULK {table_ref} ({}){}{} -- source: {}", quoted.join(", "),
         if o.table_lock { " WITH (TABLOCK)" } else { "" },
         if hint_names.is_empty() { String::new() } else { format!(" ORDER ({})", hint_names.iter().map(|(c, s)| format!("{c} {}", if *s == SortOrder::Descending { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ")) },

@@ -17,7 +17,7 @@ SQLCMD=${SQLCMD:-/opt/mssql-tools18/bin/sqlcmd}
 DUCK=${DUCK:-$HOME/.local/bin/duckdb}
 WORK=${WORK:-$(mktemp -d)}
 ROWS=${ROWS:-2000000}
-KILL_AFTER=${KILL_AFTER:-12}
+KILL_AFTER=${KILL_AFTER:-3}   # the 2 M-row switch load finishes in ~6 s on the dev box
 DB=d2m_large; SRC=d2m_large_src
 PART=$((ROWS / 25))          # rows per market / partition
 pass=0; fail=0
@@ -162,7 +162,7 @@ CREATE TABLE dbo.big (mkt char(3) NOT NULL, $cols id int NOT NULL, v decimal(18,
   CONSTRAINT pk_big PRIMARY KEY CLUSTERED (mkt, c1, c2, c3, c4, c5, c6, c7, c8, id) WITH (DATA_COMPRESSION = PAGE) ON ps_mkt(mkt)) ON ps_mkt(mkt);
 CREATE NONCLUSTERED INDEX ix_big_c1 ON dbo.big (c1) WHERE v IS NOT NULL WITH (DATA_COMPRESSION = ROW) ON ps_mkt(mkt);"
 check "big: 25 partitions" "$(qd "$DB" "SELECT COUNT(*) FROM sys.partitions WHERE object_id = OBJECT_ID('dbo.big') AND index_id = 1")" "25"
-ixbefore=$(qd "$DB" "SELECT name + ':' + type_desc + ':' + ISNULL(filter_definition,'') FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.big') ORDER BY name")
+ixbefore=$(qd "$DB" "SELECT name COLLATE DATABASE_DEFAULT + ':' + type_desc COLLATE DATABASE_DEFAULT + ':' + ISNULL(filter_definition,'') COLLATE DATABASE_DEFAULT FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.big') ORDER BY name")
 
 dcols=""; for k in 1 2 3 4 5 6 7 8; do dcols="$dcols 'c${k}_' || (hash(i + $k) % 9973) AS c$k,"; done
 duck "$WORK/big.duckdb" "CREATE TABLE big AS SELECT 'AA' || chr(65 + CAST(i % 25 AS INTEGER)) AS mkt, $dcols
@@ -184,7 +184,7 @@ check "target rows" "$(rows dbo.big)" "$ROWS"
 check "25 non-empty partitions" "$(qd "$DB" "SELECT COUNT(*) FROM sys.dm_db_partition_stats WHERE object_id = OBJECT_ID('dbo.big') AND index_id = 1 AND row_count > 0")" "25"
 check "each partition = $PART rows" "$(qd "$DB" "SELECT COUNT(*) FROM sys.dm_db_partition_stats WHERE object_id = OBJECT_ID('dbo.big') AND index_id = 1 AND row_count = $PART")" "25"
 check "no __stg_ tables left" "$(qd "$DB" "SELECT COUNT(*) FROM sys.tables WHERE name LIKE '%[_][_]stg[_]%'")" "0"
-check "indexes unchanged by load" "$(qd "$DB" "SELECT name + ':' + type_desc + ':' + ISNULL(filter_definition,'') FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.big') ORDER BY name")" "$ixbefore"
+check "indexes unchanged by load" "$(qd "$DB" "SELECT name COLLATE DATABASE_DEFAULT + ':' + type_desc COLLATE DATABASE_DEFAULT + ':' + ISNULL(filter_definition,'') COLLATE DATABASE_DEFAULT FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.big') ORDER BY name")" "$ixbefore"
 check "summary json exists" "$([ -s "$WORK/load.json" ] && echo yes)" "yes"
 check_pos "summary has \"ok\": true" "$(cnt '"ok": *true' "$WORK/load.json")"
 check_pos "log has STMT lines" "$(cnt 'STMT' "$WORK/load.log")"
@@ -228,7 +228,7 @@ CREATE TABLE dbo.t3 (id int NOT NULL PRIMARY KEY, s varchar(20) NULL);"
 duck "$WORK/t2.duckdb" "
 CREATE TABLE t2 AS SELECT CAST(i AS INTEGER) AS id, 'a' || (i % 500) AS a, CASE WHEN i % 7 = 0 THEN NULL ELSE 'b' || (i % 900) END AS b, CAST(i % 1000 AS INTEGER) AS n FROM range(200000) t(i);
 CREATE TABLE t3 AS SELECT CAST(i AS INTEGER) AS id, 's' || i AS s FROM range(5000) t(i);"
-idxsnap() { qd "$DB" "SELECT name + ':' + type_desc + ':' + CAST(is_primary_key AS varchar(1)) + ':' + CAST(is_unique AS varchar(1)) + ':' + ISNULL(filter_definition,'') FROM sys.indexes WHERE object_id = OBJECT_ID('$1') ORDER BY name"; }
+idxsnap() { qd "$DB" "SELECT name COLLATE DATABASE_DEFAULT + ':' + type_desc COLLATE DATABASE_DEFAULT + ':' + CAST(is_primary_key AS varchar(1)) + ':' + CAST(is_unique AS varchar(1)) + ':' + ISNULL(filter_definition,'') COLLATE DATABASE_DEFAULT FROM sys.indexes WHERE object_id = OBJECT_ID('$1') ORDER BY name"; }
 snap_before=$(idxsnap dbo.t2)
 xp "$WORK/h1.out" "$DB" "$WORK/t2.duckdb" --into-existing --tables t2 --split t2=hash:id:4 --strategy t2=heap-then-index -j 4 --verify checksum --log "$WORK/h1.log"
 check "heap-then-index exit 0" "$RC" "0"
@@ -297,6 +297,7 @@ sc -b -Q "ALTER DATABASE [$SRC] SET ALLOW_SNAPSHOT_ISOLATION ON" >/dev/null
 imp "$WORK/s5.out" "$WORK/s5.duckdb"
 check "snapshot advice: exit 0" "$RC" "0"
 check_pos "snapshot advice warning" "$(cnt 'ALLOW_SNAPSHOT_ISOLATION on' "$WORK/s5.out")"
+sc -b -d "$SRC" -Q "UPDATE dbo.small SET s = 'a' WHERE k = 1" >/dev/null   # case 1's holder committed 'z'
 hold
 imp "$WORK/s5b.out" "$WORK/s5b.duckdb" --isolation snapshot
 SRC_RC=$RC

@@ -80,8 +80,18 @@ fn rewrite_select(job_sql: &str, exprs: &[String]) -> Option<String> {
     Some(format!("SELECT {} {}", exprs.join(", "), job_sql[i + 1..].trim()))
 }
 
-fn mapped_exprs(duck: &Table, m: &TableMapping) -> Vec<String> {
-    m.columns.iter().map(|c| { let e = &duck.columns[c.duck_index].select_expr; if e.is_empty() { quote_duck(&duck.columns[c.duck_index].name) } else { e.clone() } }).collect()
+fn mapped_exprs(duck: &Table, m: &TableMapping, allow_rescale: bool) -> Vec<String> {
+    m.columns.iter().map(|c| {
+        let col = &duck.columns[c.duck_index];
+        let e = if col.select_expr.is_empty() { quote_duck(&col.name) } else { col.select_expr.clone() };
+        // the converter never rounds: with --allow-rescale the DuckDB side casts to the target scale
+        if allow_rescale && matches!(c.target.type_name.as_str(), "decimal" | "numeric" | "money" | "smallmoney") {
+            let (base, arg) = crate::core::typemap::parse_type(&col.duck_type);
+            let src_scale: u8 = if base == "DECIMAL" { arg.split(',').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0) } else { 0 };
+            if src_scale > c.target.scale { return format!("CAST({e} AS DECIMAL({},{}))", c.target.precision.max(1), c.target.scale); }
+        }
+        e
+    }).collect()
 }
 
 struct TableCtx {
@@ -132,7 +142,7 @@ pub fn load_into_existing(con: &Connection, cat: &Catalog, target: &MssqlTarget,
         findings.extend(fs);
         let convs: Vec<Converter> = mapping.columns.iter().map(|cm| Converter::for_target(&cm.target, &duck.columns[cm.duck_index].duck_type).with_context(|| format!("{}.{}", tt.full_name(), cm.target.name))).collect::<Result<_>>()?;
         let columns: Vec<String> = mapping.columns.iter().map(|cm| cm.target.name.clone()).collect();
-        let exprs = mapped_exprs(duck, &mapping);
+        let exprs = mapped_exprs(duck, &mapping, o.preflight.allow_rescale);
         let strategy = jobs::lookup(&o.strategies, &duck.schema, &duck.name).copied()
             .or_else(|| jobs::lookup(&o.strategies, &duck.schema, "*").copied()).or_else(|| o.strategies.get("*").copied())
             .unwrap_or(o.default_strategy);
@@ -287,7 +297,7 @@ async fn run_job(con: &Connection, client: &mut MsClient, x: &TableCtx, job: &Jo
     }
     let label = job.id.clone();
     let prog = move |n: i64| progress(&label, n);
-    let opts = BulkOptions { batch_rows, keep_identity: x.keep_identity, table_lock: true, prefetch_batches: 4, order_by: None };
+    let opts = BulkOptions { batch_rows, keep_identity: x.keep_identity, table_lock: true, prefetch_batches: 4, order_by: None, check_constraints: true };
     match x.strategy {
         Strategy::Switch => {
             let mut s = switch::prepare_staging(client, &x.target, job).await?;

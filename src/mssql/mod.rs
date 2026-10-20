@@ -82,6 +82,10 @@ impl MssqlTarget {
         if self.trust_cert { c.trust_cert(); }
         c.encryption(if self.encrypt { EncryptionLevel::Required } else { EncryptionLevel::NotSupported });
         c.application_name("duckbridge");
+        // tiberius 0.13 aborts a response that stalls for 30 s by default. Index builds, SWITCH waits,
+        // BACKUP/RESTORE and checksum queries on big tables legitimately stay silent far longer; the
+        // bounded waits DuckBridge wants are server-side (SET LOCK_TIMEOUT, spec R6), so wait indefinitely.
+        c.command_timeout(None);
         Ok(c)
     }
 

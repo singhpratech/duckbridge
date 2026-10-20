@@ -364,7 +364,7 @@ duckbridge export work.duckdb --to server --host TGT --database _stage_db --into
     --split big_table=column:Mkt --strategy big_table=switch --strategy '*'=serial -j 8 \
     --max-jobs-per-table 6 --state-dir state/ --replace-partitions --drop-old
 duckbridge export work.duckdb --to server --host TGT --database _stage_db --into-existing \
-    --source-parquet 'big_table=out/big_table/Mkt=*/' --split 'big_table=files:out/big_table/Mkt=*/' --strategy big_table=switch
+    --source-parquet 'big_table=out/big_table/Mkt=*/' --strategy big_table=switch   # a Parquet source implies a files: split, one job per folder
 ```
 
 | Flag | Meaning |

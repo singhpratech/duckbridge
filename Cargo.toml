@@ -1,6 +1,6 @@
 [package]
 name = "duckbridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "DuckBridge: move databases between DuckDB and SQL Server / PostgreSQL / Parquet, translate SQL between dialects, and ship results back as a restorable SQL Server .bak."
 license = "MIT"

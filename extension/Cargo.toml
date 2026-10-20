@@ -1,6 +1,6 @@
 [package]
 name = "duckbridge_ext"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "DuckBridge as a loadable DuckDB extension: bridge_import / bridge_export / bridge_run / bridge_transpile"
 license = "MIT"

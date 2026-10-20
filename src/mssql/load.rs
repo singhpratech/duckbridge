@@ -209,7 +209,7 @@ async fn bulk_table(con: &Connection, client: &mut MsClient, t: &Table, sql: &st
     let tref = em.table_ref(&t.schema, &t.name);
     let convs: Vec<Converter> = t.columns.iter().map(|c| Converter::for_sql_type(&c.sql_type, &c.duck_type).with_context(|| format!("{}.{}.{}", t.schema, t.name, c.name))).collect::<Result<_>>()?;
     let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
-    let o = BulkOptions { batch_rows, keep_identity: t.has_identity(), table_lock: true, prefetch_batches: 4, order_by: None };
+    let o = BulkOptions { batch_rows, keep_identity: t.has_identity(), table_lock: true, prefetch_batches: 4, order_by: None, check_constraints: true };
     let tag = format!("{}.{}", t.schema, t.name);
     bulk_load(con, client, &tref, &cols, &convs, sql, &o, &|n| progress(&tag, n)).await
 }
