@@ -681,7 +681,7 @@ mod tests {
                              ty("DATETIME2(7)"), ty("DATETIME2(3)"), ty("DATETIME"), ty("SMALLDATETIME"), ty("TIME(7)"), ty("DATETIMEOFFSET(7)"),
                              ty("BIT"), ty("TINYINT"), ty("UNIQUEIDENTIFIER"), ty("VARBINARY(16)"), ty("FLOAT(53)")];
             let sql = "SELECT id, v, nv, c3, amt, big, money_v, d, ts, ts, ts, CASE WHEN ts < TIMESTAMP '2079-06-06' THEN ts END, ts::TIME, ts::TIMESTAMPTZ, flag, tiny, g::VARCHAR, bin, f FROM src";
-            let o = BulkOptions { batch_rows: 4_000, keep_identity: true, table_lock: true, prefetch_batches: 4, order_by: Some("id".into()) };
+            let o = BulkOptions { batch_rows: 4_000, keep_identity: true, table_lock: true, prefetch_batches: 4, order_by: Some("id".into()), check_constraints: true };
             let calls = std::cell::Cell::new(0);
             let t0 = Instant::now();
             let sent = bulk_load(&con, &mut c, "[dbo].[c_bulk]", &cols, &convs, sql, &o, &|_| calls.set(calls.get() + 1)).await.unwrap();
@@ -723,7 +723,7 @@ mod tests {
             con.execute_batch("CREATE TABLE bad AS SELECT i::INTEGER AS id, CASE WHEN i = 3000 THEN 'caf\u{e9}' ELSE 'ok' END AS v FROM range(5000) r(i)").unwrap();
             crate::mssql::exec_batch(&mut c, "DROP TABLE IF EXISTS dbo.c_bad; CREATE TABLE dbo.c_bad (id INT NOT NULL, v VARCHAR(10) NOT NULL)").await.unwrap();
             let mut c2 = target.connect("_agent_c").await.unwrap();
-            let o = BulkOptions { batch_rows: 1_000, keep_identity: false, table_lock: false, prefetch_batches: 2, order_by: None };
+            let o = BulkOptions { batch_rows: 1_000, keep_identity: false, table_lock: false, prefetch_batches: 2, order_by: None, check_constraints: true };
             let e = bulk_load(&con, &mut c2, "dbo.c_bad", &["id".into(), "v".into()], &[Converter::Int, ty("VARCHAR(10)")], "SELECT id, v FROM bad ORDER BY id", &o, &|_| {}).await.unwrap_err().to_string();
             assert!(e.contains("dbo.c_bad") && e.contains("column v") && e.contains("row 3001") && e.contains("non-ASCII"), "{e}");
             drop(c2);
