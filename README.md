@@ -461,7 +461,7 @@ done; the plan for the rest, in priority order:
 | 1 | SQL Server 2019 / 2022 / 2025 | import, live load, `.bak`, T-SQL ⇄ DuckDB | done |
 | 1 | PostgreSQL | export via `COPY`, DuckDB ⇄ PostgreSQL SQL | export done; import next |
 | 1 | Parquet | export, any engine can absorb it | done |
-| 2 | **DuckDB extension** (`duckbridge`) | `bridge_import`, `bridge_export`, `bridge_run`, `bridge_transpile` straight from DuckDB SQL | done (see below); community-extension submission next |
+| 2 | **DuckDB extension** (`duckbridge`) | `bridge_import`, `bridge_export`, `bridge_run`, `bridge_transpile` straight from DuckDB SQL | done; in the community registry (1.5.6 line); DuckDB 2.0 port waits on `duckdb-neo` |
 | 2 | PostgreSQL import | binary `COPY TO STDOUT`, key-range parallel streams, identity → sequence | planned |
 | 3 | MySQL / MariaDB | `LOAD DATA LOCAL INFILE`, MySQL dialect rules | planned |
 | 3 | Oracle | `SQL*Loader`-style direct path over OCI-free wire protocol, PL/SQL-lite rules | planned |
@@ -550,11 +550,14 @@ after a session that used the bridge (DuckDB replays it on the next open; the br
 after each operation to keep it small). The extension is built on DuckDB's C extension API via
 `duckdb-rs`, which currently requires the *unstable* struct, so each binary is pinned to one
 DuckDB release (`v1.5.6` today, see `extension/Makefile`). CI builds Linux x86_64/arm64,
-macOS Intel/ARM and Windows. The community-extension submission
+macOS Intel/ARM and Windows. The extension is in the DuckDB community registry
 ([duckdb/community-extensions#3147](https://github.com/duckdb/community-extensions/pull/3147), built from
-[duckbridge-extension](https://github.com/singhpratech/duckbridge-extension)) will make it
-`INSTALL duckbridge FROM community`; until it is merged, load the file with `duckdb -unsigned` or
-`SET allow_unsigned_extensions = true`.
+[duckbridge-extension](https://github.com/singhpratech/duckbridge-extension)). One caveat: the registry
+now builds for the upcoming DuckDB 2.0, whose extensions need a new C API that the Rust bindings
+(`duckdb-neo`) do not ship yet, so `INSTALL duckbridge FROM community` works only once a 1.5.6 build is
+served there or the 2.0 port lands. On DuckDB 1.5.6, download the `duckbridge-<platform>.duckdb_extension.zip`
+from the [releases](https://github.com/singhpratech/duckbridge/releases) and load it with
+`duckdb -unsigned` or `SET allow_unsigned_extensions = true`.
 
 ## Build
 
