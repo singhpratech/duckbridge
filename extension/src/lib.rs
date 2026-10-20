@@ -280,7 +280,7 @@ impl VTab for ExportVTab {
 
 // ------------------------------------------------------------------ bridge_run
 
-pub struct RunBind { sql: String, from: Dialect, nocase: bool, schema_map: String, continue_on_error: bool }
+pub struct RunBind { sql: String, req: api::RunRequest }
 struct RunVTab;
 
 impl VTab for RunVTab {
@@ -291,12 +291,19 @@ impl VTab for RunVTab {
         add_result_columns(bind);
         let from_s = s_param(bind, "from").unwrap_or_else(|| "tsql".into());
         let from = Dialect::parse(&from_s).ok_or_else(|| format!("unknown dialect {from_s:?} (tsql, duckdb, postgres)"))?;
+        // nocase := true/false keeps working (rewrite / off); nocase_mode := 'global' | 'rewrite' | 'off' is explicit
+        let nocase = s_param(bind, "nocase_mode").unwrap_or_else(|| if b_param(bind, "nocase", true) { "rewrite".into() } else { "off".into() });
         Ok(RunBind {
             sql: bind.get_parameter(0).to_string(),
-            from,
-            nocase: b_param(bind, "nocase", true),
-            schema_map: s_param(bind, "schema_map").unwrap_or_default(),
-            continue_on_error: b_param(bind, "continue_on_error", false),
+            req: api::RunRequest {
+                from,
+                nocase,
+                strict: b_param(bind, "strict", false),
+                mssql_math: b_param(bind, "mssql_math", false),
+                types: s_param(bind, "types").unwrap_or_default(),
+                schema_map: s_param(bind, "schema_map").unwrap_or_default(),
+                continue_on_error: b_param(bind, "continue_on_error", false),
+            },
         })
     }
 
@@ -306,7 +313,7 @@ impl VTab for RunVTab {
         let b = func.get_bind_data();
         func.get_init_data().emit(output, || {
             let con = connect()?;
-            let r = api::run_script(&con, &b.sql, b.from, b.nocase, &b.schema_map, b.continue_on_error);
+            let r = api::run_script(&con, &b.sql, &b.req);
             let _ = con.execute_batch("RESET integer_division; RESET default_null_order; RESET TimeZone; RESET default_collation;");
             r
         })
@@ -315,7 +322,7 @@ impl VTab for RunVTab {
     fn parameters() -> Option<Vec<LogicalTypeHandle>> { Some(vec![varchar()]) }
 
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
-        named(&[("from", varchar()), ("nocase", boolean()), ("schema_map", varchar()), ("continue_on_error", boolean())])
+        named(&[("from", varchar()), ("nocase", boolean()), ("nocase_mode", varchar()), ("strict", boolean()), ("mssql_math", boolean()), ("types", varchar()), ("schema_map", varchar()), ("continue_on_error", boolean())])
     }
 }
 
@@ -350,7 +357,7 @@ impl VScalar for TranspileScalar {
             let dst = Dialect::parse(t).ok_or_else(|| format!("unknown target dialect {t:?}"))?;
             let default: &[(&str, &str)] = match (src, dst) { (Dialect::Tsql, _) => &[("dbo", "main")], (_, Dialect::Tsql) => &[("main", "dbo")], _ => &[("main", "public")] };
             let sm = api::parse_schema_map("", default);
-            let opts = transpile::Options { target_version: version[i].unwrap_or(2019) as u16, prelude: false, nocase: true, float_division: true };
+            let opts = transpile::Options { target_version: version[i].unwrap_or(2019) as u16, prelude: false, float_division: true, ..transpile::Options::default() };
             let tr = transpile::translate_with(s, src, dst, &sm, &opts)?;
             let text = if tr.warnings.is_empty() { tr.sql } else {
                 let mut w: String = tr.warnings.iter().map(|w| format!("-- WARNING: {w}\n")).collect();
@@ -383,7 +390,7 @@ impl VScalar for PreludeScalar {
         let out = output.flat_vector();
         for i in 0..n {
             let nocase = if v.row_is_null(i as u64) { true } else { vals[i] };
-            let text = transpile::duckdb_prelude(nocase).iter().map(|p| p.trim().trim_end_matches(';').to_string() + ";").collect::<Vec<_>>().join("\n");
+            let text = transpile::duckdb_prelude_for(if nocase { transpile::NocaseMode::Rewrite } else { transpile::NocaseMode::Off }).iter().map(|p| p.trim().trim_end_matches(';').to_string() + ";").collect::<Vec<_>>().join("\n");
             out.insert(i, text.as_str());
         }
         Ok(())

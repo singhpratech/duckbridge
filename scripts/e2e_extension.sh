@@ -33,7 +33,7 @@ echo "== 1. load + transpile =="
 check "transpile tsql->duck" "$(d "SELECT bridge_transpile('tsql','duckdb','SELECT TOP 2 ISNULL(a,0) FROM dbo.t')")" "SELECT COALESCE(a, 0) FROM main.t LIMIT 2;"
 check "transpile duck->tsql 2022" "$(d "SELECT bridge_transpile('duckdb','tsql','SELECT greatest(a,b) FROM t', 2022)")" "SELECT greatest(a, b) FROM t;"
 check "transpile duck->tsql 2019" "$(d "SELECT bridge_transpile('duckdb','tsql','SELECT greatest(a,b) FROM t', 2019)")" "SELECT (SELECT MAX(v) FROM (VALUES (a), (b)) AS g(v)) FROM t;"
-check "prelude lines" "$(d "SELECT length(string_split(bridge_prelude(true), chr(10)))")" "4"
+check "prelude lines" "$(d "SELECT length(string_split(bridge_prelude(true), chr(10)))")" "3"
 check "bad dialect errors" "$(d "SELECT bridge_transpile('oracle','duckdb','x')" | grep -c "unknown source dialect")" "1"
 
 echo "== 2. bridge_import =="

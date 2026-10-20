@@ -38,6 +38,10 @@ enum Cmd {
     Export(ExportArgs),
     /// Copy a file between local disk and s3:// az:// gs:// (uses the built-in storage clients)
     Cp { src: String, dst: String },
+    /// Report values that differ only by case or trailing spaces (where SQL Server's CI collation would merge them)
+    AuditCi(AuditCiArgs),
+    /// Evaluate random arithmetic cases on SQL Server and DuckDB (with the mssql_* macros) and report mismatches
+    VerifyMath(VerifyMathArgs),
     /// Cut over: rename live tables to <live>__old_<timestamp> and new tables to the live names, all or nothing
     Swap(SwapArgs),
     /// Drop <table>__old_<timestamp> tables left by swap that are older than a date
@@ -124,9 +128,18 @@ struct TranspileArgs {
     /// Do not emit the DuckDB session prelude (integer division, NULL order, nocase collation, UTC)
     #[arg(long)]
     no_prelude: bool,
-    /// Assume SQL Server's default case-insensitive collation (LIKE -> ILIKE, nocase)
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    nocase: bool,
+    /// Case-insensitive string handling: rewrite (per-literal lower()/rtrim, default) | global (nocase collation) | off
+    #[arg(long, default_value = "rewrite")]
+    nocase: String,
+    /// Fail (exit 1) on any translator warning
+    #[arg(long)]
+    strict: bool,
+    /// Use the exact SQL Server arithmetic macros (mssql_div, mssql_round, ...) in the output
+    #[arg(long)]
+    mssql_math: bool,
+    /// Column types for exact arithmetic when they are not declared in the script: col=decimal(18,4),qty=int
+    #[arg(long, default_value = "")]
+    types: String,
 }
 
 #[derive(Args)]
@@ -147,9 +160,44 @@ struct RunArgs {
     memory_limit: Option<String>,
     #[arg(long)]
     threads: Option<usize>,
-    /// Assume SQL Server's default case-insensitive collation (LIKE -> ILIKE, nocase)
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    nocase: bool,
+    /// Case-insensitive string handling: rewrite (per-literal lower()/rtrim, default) | global (nocase collation; slow on big GROUP BY/DISTINCT) | off
+    #[arg(long, default_value = "rewrite")]
+    nocase: String,
+    /// Fail (exit 1) on any translator warning before executing anything
+    #[arg(long)]
+    strict: bool,
+    /// Install the exact SQL Server arithmetic macros and translate divisions/ROUND/TRY_CAST onto them
+    #[arg(long)]
+    mssql_math: bool,
+    /// Column types for exact arithmetic when they are not declared in the script: col=decimal(18,4),qty=int
+    #[arg(long, default_value = "")]
+    types: String,
+}
+
+#[derive(Args)]
+struct AuditCiArgs {
+    /// DuckDB file
+    duckdb: String,
+    #[arg(long, value_delimiter = ',')]
+    tables: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    columns: Vec<String>,
+    /// T-SQL script whose string literals are checked against the column values
+    #[arg(long)]
+    script: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct VerifyMathArgs {
+    #[command(flatten)]
+    conn: ConnArgs,
+    /// Random cases per macro
+    #[arg(long, default_value_t = 500)]
+    cases: usize,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
 }
 
 #[derive(Args, Clone)]
@@ -427,6 +475,8 @@ fn real_main() -> Result<()> {
         Cmd::Run(a) => run(a, q),
         Cmd::Import(a) => import(a, q),
         Cmd::Export(a) => export(a, q),
+        Cmd::AuditCi(a) => audit_ci_cmd(a, q),
+        Cmd::VerifyMath(a) => verify_math_cmd(a),
         Cmd::Swap(a) => swap_cmd(a),
         Cmd::DropOld(a) => drop_old_cmd(a),
         Cmd::Cp { src, dst } => {
@@ -438,6 +488,45 @@ fn real_main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn audit_ci_cmd(a: AuditCiArgs, q: bool) -> Result<()> {
+    let path = localize(&a.duckdb, q)?;
+    let con = open_readonly(&path.to_string_lossy())?;
+    let script = a.script.as_ref().map(std::fs::read_to_string).transpose()?;
+    let rows = duckbridge::audit::audit_ci(&con, &a.tables, &a.columns, script.as_deref())?;
+    if a.json { println!("{}", serde_json::to_string_pretty(&rows)?); }
+    else {
+        for r in &rows { println!("{:<14} {}.{}  {} value(s): {}", r.kind, r.table, r.column, r.count, r.examples.join(" | ")); }
+        if rows.is_empty() { println!("no case-only or trailing-space-only collisions: binary comparisons give SQL Server's CI_AS results for this data"); }
+        else { println!("{} finding(s); a global nocase collation is needed only for the columns above (or fix the literals)", rows.len()); }
+    }
+    if rows.is_empty() { Ok(()) } else { Err(duckbridge::core::runlog::Failure::Check(format!("{} column(s) have case/trailing-space collisions", rows.len())).into()) }
+}
+
+fn verify_math_cmd(a: VerifyMathArgs) -> Result<()> {
+    use duckbridge::mathcompat::*;
+    let cases = verify_cases(a.cases, a.seed);
+    let duck = duckdb::Connection::open_in_memory()?;
+    let d = duck_eval(&duck, &cases)?;
+    let rt = mssql::runtime()?;
+    let target = a.conn.target("master");
+    let ms: Vec<String> = rt.block_on(async {
+        let mut c = target.connect("master").await?;
+        let mut out = vec![];
+        for case in &cases {
+            let rows = c.simple_query(&tsql_query(case)).await?.into_first_result().await?;
+            let v: String = rows.first().map(|r| match r.try_get::<&str, _>(0) { Ok(Some(s)) => s.to_string(), Ok(None) => "NULL".into(), Err(_) => format!("{:?}", r.get::<f64, _>(0)) }).unwrap_or("NULL".into());
+            out.push(v);
+        }
+        Ok::<_, anyhow::Error>(out)
+    })?;
+    let bad = compare(&cases, &d, &ms);
+    for m in &bad { println!("MISMATCH #{}: {}
+   DuckDB    {}
+   SQLServer {}", m.index, m.case.expr_tsql, m.duck, m.mssql); }
+    println!("{} case(s), {} mismatch(es)", cases.len(), bad.len());
+    if bad.is_empty() { Ok(()) } else { Err(duckbridge::core::runlog::Failure::Check(format!("{} arithmetic mismatch(es)", bad.len())).into()) }
 }
 
 fn swap_cmd(a: SwapArgs) -> Result<()> {
@@ -500,8 +589,14 @@ fn transpile_cmd(a: TranspileArgs) -> Result<()> {
     let (from, to): (Dialect, Dialect) = (a.from.into(), a.to.into());
     let default = match (from, to) { (Dialect::Tsql, _) => [("dbo", "main")], (_, Dialect::Tsql) => [("main", "dbo")], _ => [("main", "public")] };
     let sm = schema_map(&a.schema_map, &default);
-    let opts = transpile::Options { target_version: a.target_version, prelude: !a.no_prelude, nocase: a.nocase, float_division: true, ..transpile::Options::default() };
-    let out = transpile::translate_with(&sql, from, to, &sm, &opts)?;
+    let mode = duckbridge::api::nocase_mode(&a.nocase)?;
+    let opts = transpile::Options { target_version: a.target_version, prelude: !a.no_prelude, nocase_mode: Some(mode), strict: a.strict, mssql_math: a.mssql_math, types: transpile::parse_types(&a.types), float_division: true, ..transpile::Options::default() };
+    let out = match transpile::translate_with(&sql, from, to, &sm, &opts) {
+        Ok(t) => t,
+        Err(e @ transpile::TranslateError::Strict(_)) => return Err(duckbridge::core::runlog::Failure::Check(format!("--strict: translator warnings
+{e}")).into()),
+        Err(e) => return Err(e.into()),
+    };
     match a.out {
         Some(p) => { std::fs::write(&p, &out.sql)?; eprintln!("wrote {}", p.display()); }
         None => println!("{}", out.sql),
@@ -514,11 +609,20 @@ fn run(a: RunArgs, q: bool) -> Result<()> {
     let sql = read_input(&a.script)?;
     let from: Dialect = a.from.into();
     let sm = schema_map(&a.schema_map, &[("dbo", "main")]);
-    let opts = transpile::Options { prelude: false, nocase: a.nocase, ..transpile::Options::default() };
-    let tr = transpile::translate_with(&sql, from, Dialect::DuckDb, &sm, &opts)?;
+    let mode = duckbridge::api::nocase_mode(&a.nocase)?;
+    let opts = transpile::Options { prelude: false, nocase_mode: Some(mode), strict: a.strict, mssql_math: a.mssql_math, types: transpile::parse_types(&a.types), ..transpile::Options::default() };
+    let tr = match transpile::translate_with(&sql, from, Dialect::DuckDb, &sm, &opts) {
+        Ok(t) => t,
+        Err(e @ transpile::TranslateError::Strict(_)) => return Err(duckbridge::core::runlog::Failure::Check(format!("--strict: the script has translator warnings; nothing was executed
+{e}")).into()),
+        Err(e) => return Err(e.into()),
+    };
     print_warnings(&tr.warnings);
     let con = duckdb::Connection::open(&a.duckdb)?;
-    if from == Dialect::Tsql { for p in transpile::duckdb_prelude(a.nocase) { con.execute_batch(p)?; } }
+    if from == Dialect::Tsql {
+        for p in transpile::duckdb_prelude_for(mode) { con.execute_batch(p)?; }
+        if a.mssql_math { duckbridge::mathcompat::install(&con)?; }
+    }
     if let Some(m) = &a.memory_limit { con.execute_batch(&format!("SET memory_limit='{m}'"))?; }
     if let Some(t) = a.threads { con.execute_batch(&format!("SET threads={t}"))?; }
     let mut ok = 0;

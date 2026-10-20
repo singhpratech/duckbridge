@@ -8,7 +8,7 @@ use crate::transpile::tokens::{tokenize, Kind};
 use anyhow::Result;
 use duckdb::Connection;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AuditRow {
     pub table: String,
     pub column: String,

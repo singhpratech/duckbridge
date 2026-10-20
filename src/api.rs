@@ -446,19 +446,55 @@ pub fn export_parquet(con: &Connection, out_dir: &str, r: &ExportRequest) -> Res
 
 // ---------------------------------------------------------------- run
 
-/// Translate a script from `from` to DuckDB SQL and execute it statement by statement on `con`.
+#[derive(Debug, Clone)]
+pub struct RunRequest {
+    pub from: Dialect,
+    /// "rewrite" (default: per-literal case-insensitive comparisons), "global" (nocase collation), "off"
+    pub nocase: String,
+    /// Any translator warning aborts before anything runs (exit 1).
+    pub strict: bool,
+    /// Install the exact SQL Server arithmetic macros and use them in the translation.
+    pub mssql_math: bool,
+    /// Column types for exact arithmetic: "col=decimal(18,4),qty=int"
+    pub types: String,
+    pub schema_map: String,
+    pub continue_on_error: bool,
+}
+
+impl Default for RunRequest {
+    fn default() -> Self { RunRequest { from: Dialect::Tsql, nocase: "rewrite".into(), strict: false, mssql_math: false, types: String::new(), schema_map: String::new(), continue_on_error: false } }
+}
+
+/// Parse a nocase setting: a mode name or the legacy true/false.
+pub fn nocase_mode(s: &str) -> Result<transpile::NocaseMode> {
+    match s.trim().to_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(transpile::NocaseMode::Rewrite),
+        "false" | "no" | "0" => Ok(transpile::NocaseMode::Off),
+        other => transpile::NocaseMode::parse(other).ok_or_else(|| anyhow!("nocase must be global, rewrite or off, got {s:?}")),
+    }
+}
+
+/// Translate a script from `r.from` to DuckDB SQL and execute it statement by statement on `con`.
 /// The SQL Server compatibility prelude is applied to this session only.
-pub fn run_script(con: &Connection, sql: &str, from: Dialect, nocase: bool, schema_map: &str, continue_on_error: bool) -> Result<Vec<Row>> {
-    let sm = parse_schema_map(schema_map, &[("dbo", "main")]);
-    let opts = transpile::Options { prelude: false, nocase, ..transpile::Options::default() };
-    let tr = transpile::translate_with(sql, from, Dialect::DuckDb, &sm, &opts)?;
+pub fn run_script(con: &Connection, sql: &str, r: &RunRequest) -> Result<Vec<Row>> {
+    let from = r.from;
+    let sm = parse_schema_map(&r.schema_map, &[("dbo", "main")]);
+    let mode = nocase_mode(&r.nocase)?;
+    let opts = transpile::Options { prelude: false, nocase_mode: Some(mode), strict: r.strict, mssql_math: r.mssql_math, types: transpile::parse_types(&r.types), ..transpile::Options::default() };
+    let tr = match transpile::translate_with(sql, from, Dialect::DuckDb, &sm, &opts) {
+        Ok(t) => t,
+        Err(e @ transpile::TranslateError::Strict(_)) => return Err(crate::core::runlog::Failure::Check(format!("--strict: the script has translator warnings; nothing was executed
+{e}")).into()),
+        Err(e) => return Err(e.into()),
+    };
     let mut out: Vec<Row> = tr.warnings.iter().map(|w| Row::warn(w)).collect();
     if from == Dialect::Tsql {
-        for p in transpile::duckdb_prelude(nocase) {
+        for p in transpile::duckdb_prelude_for(mode) {
             // keep the compatibility settings local to this session
             let s = p.trim_start().strip_prefix("SET ").map(|rest| format!("SET SESSION {rest}")).unwrap_or_else(|| p.to_string());
             con.execute_batch(&s)?;
         }
+        if r.mssql_math { crate::mathcompat::install(con)?; }
     }
     let mut failed = 0;
     for stmt in transpile::tokens::statements(&transpile::tokens::tokenize(&tr.sql, false)) {
@@ -477,7 +513,7 @@ pub fn run_script(con: &Connection, sql: &str, from: Dialect, nocase: bool, sche
             Err(e) => {
                 failed += 1;
                 out.push(Row::new(label, "failed", 0, e.to_string()));
-                if !continue_on_error { bail!("{e}\n  in: {}", s.chars().take(300).collect::<String>()); }
+                if !r.continue_on_error { bail!("{e}\n  in: {}", s.chars().take(300).collect::<String>()); }
             }
         }
     }
