@@ -145,6 +145,18 @@ impl VTab for ImportVTab {
             schema_only: b_param(bind, "schema_only", false),
             keys_after_load: b_param(bind, "keys_after_load", false),
             overwrite: b_param(bind, "overwrite", false),
+            isolation: s_param(bind, "isolation").unwrap_or(d.isolation),
+            lock_timeout_ms: i_param(bind, "lock_timeout", d.lock_timeout_ms),
+            lock_check: b_param(bind, "lock_check", true),
+            lock_wait_s: i_param(bind, "lock_wait", d.lock_wait_s as i64).max(0) as u64,
+            on_lock: s_param(bind, "on_lock").unwrap_or(d.on_lock),
+            max_rereads: i_param(bind, "max_rereads", d.max_rereads as i64).max(0) as u32,
+            manifest: s_param(bind, "manifest"),
+            readonly: b_param(bind, "readonly", false),
+            wait_for: s_param(bind, "wait_for"),
+            wait_timeout_s: i_param(bind, "wait_timeout", d.wait_timeout_s as i64).max(0) as u64,
+            log_file: s_param(bind, "log_file"),
+            summary_file: s_param(bind, "summary_file"),
         };
         Ok(ImportBind { dsn: bind.get_parameter(0).to_string(), req })
     }
@@ -167,6 +179,9 @@ impl VTab for ImportVTab {
             ("tables", varchar()), ("exclude", varchar()), ("parallel", bigint()), ("split_threshold", bigint()),
             ("batch_rows", bigint()), ("schema_map", varchar()), ("nolock", boolean()), ("schema_only", boolean()),
             ("keys_after_load", boolean()), ("overwrite", boolean()),
+            ("isolation", varchar()), ("lock_timeout", bigint()), ("lock_check", boolean()), ("lock_wait", bigint()), ("on_lock", varchar()),
+            ("max_rereads", bigint()), ("manifest", varchar()), ("readonly", boolean()), ("wait_for", varchar()), ("wait_timeout", bigint()),
+            ("log_file", varchar()), ("summary_file", varchar()),
         ])
     }
 }

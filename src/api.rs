@@ -125,11 +125,36 @@ pub struct ImportRequest {
     pub keys_after_load: bool,
     /// Drop target tables/views that already exist in DuckDB before creating them.
     pub overwrite: bool,
+    // ---- safe reads (spec R6) ----
+    /// "read-committed" (default), "read-uncommitted", "snapshot"
+    pub isolation: String,
+    pub lock_timeout_ms: i64,
+    pub lock_check: bool,
+    pub lock_wait_s: u64,
+    /// "fail" (default) or "skip"
+    pub on_lock: String,
+    pub max_rereads: u32,
+    pub manifest: Option<String>,
+    pub readonly: bool,
+    pub wait_for: Option<String>,
+    pub wait_timeout_s: u64,
+    pub log_file: Option<String>,
+    pub summary_file: Option<String>,
 }
 
 impl Default for ImportRequest {
     fn default() -> Self {
-        ImportRequest { tables: vec![], exclude: vec![], parallel: 0, split_threshold: 20_000_000, batch_rows: 50_000, schema_map: String::new(), nolock: false, schema_only: false, keys_after_load: false, overwrite: false }
+        ImportRequest { tables: vec![], exclude: vec![], parallel: 0, split_threshold: 20_000_000, batch_rows: 50_000, schema_map: String::new(), nolock: false, schema_only: false, keys_after_load: false, overwrite: false,
+            isolation: "read-committed".into(), lock_timeout_ms: 1000, lock_check: true, lock_wait_s: 30, on_lock: "fail".into(), max_rereads: 2, manifest: None, readonly: false, wait_for: None, wait_timeout_s: 3600, log_file: None, summary_file: None }
+    }
+}
+
+impl ImportRequest {
+    fn safety(&self) -> Result<crate::mssql::fingerprint::ReadSafety> {
+        use crate::mssql::fingerprint::*;
+        let mut s = ReadSafety { lock_timeout_ms: self.lock_timeout_ms, isolation: Isolation::parse(&self.isolation)?, lock_check: self.lock_check, lock_wait_s: self.lock_wait_s, on_lock: OnLock::parse(&self.on_lock)?, max_rereads: self.max_rereads, readonly_intent: self.readonly, manifest: self.manifest.as_ref().map(PathBuf::from), wait_for: self.wait_for.clone(), wait_timeout_s: self.wait_timeout_s };
+        if self.nolock && self.isolation == "read-committed" { s.isolation = Isolation::ReadUncommitted; }
+        Ok(s)
     }
 }
 
@@ -139,12 +164,14 @@ pub fn import_mssql(con: &Connection, dsn: &Dsn, r: &ImportRequest) -> Result<Ve
     if dsn.scheme != "mssql" && dsn.scheme != "sqlserver" { bail!("bridge_import expects an mssql:// URL, got {}://", dsn.scheme); }
     let database = dsn.database.clone().ok_or_else(|| anyhow!("the URL must name the source database: mssql://user:pass@host:port/Database"))?;
     let target = dsn.mssql_target(Some(&database));
+    crate::core::runlog::init(r.log_file.as_deref().map(std::path::Path::new), r.summary_file.as_deref().map(std::path::Path::new), false, 10);
+    let safety = r.safety()?;
     let opts = ImportOptions { keys_after_load: r.keys_after_load, include: r.tables.clone(), exclude: r.exclude.clone(), parallel: cores(r.parallel), split_threshold: r.split_threshold, batch_rows: r.batch_rows, schema_map: parse_schema_map(&r.schema_map, &[("dbo", "main")]), nolock: r.nolock };
     let rt = mssql::runtime()?;
     let mut warnings = vec![];
     let (tables, views) = rt.block_on(async {
-        let mut c = target.connect(&database).await?;
-        read_catalog(&mut c, &opts, &mut warnings).await
+        let mut c = crate::mssql::fingerprint::connect(&target, &database, &safety).await?;
+        read_catalog_with(&mut c, &opts, &safety, &mut warnings).await
     })?;
     let t0 = std::time::Instant::now();
     if r.overwrite {
@@ -158,9 +185,13 @@ pub fn import_mssql(con: &Connection, dsn: &Dsn, r: &ImportRequest) -> Result<Ve
     let mut total = 0i64;
     if !r.schema_only {
         let progress: Arc<dyn Fn(&str, i64) + Send + Sync> = Arc::new(|_, _| {});
-        let rep = copy_data(con, &target, &tables, &opts, progress)?;
+        let rep = copy_data_with(con, &target, &tables, &opts, &safety, progress)?;
         warnings.extend(rep.warnings);
         total = rep.rows;
+        for m in &rep.manifest {
+            out.push(Row::new(m.table.clone(), "manifest", m.rows_read, format!("source stats {} rows; before [{}]; after [{}]; {} re-read(s); {}; {:.1}s", m.rows_source_stats, m.fingerprint_before, m.fingerprint_after, m.rereads, m.isolation, m.seconds)));
+            crate::core::runlog::summary_add(crate::core::runlog::SummaryEntry { table: m.table.clone(), job: "import".into(), rows: m.rows_read, seconds: m.seconds, strategy: m.isolation.clone(), checks: vec![format!("rereads {}", m.rereads)], ok: m.rows_read >= 0 });
+        }
         add_keys(con, &tables, &opts, &mut warnings)?;
     }
     create_duck_views(con, &views, &opts, &mut warnings);
@@ -177,6 +208,7 @@ pub fn import_mssql(con: &Connection, dsn: &Dsn, r: &ImportRequest) -> Result<Ve
     let secs = t0.elapsed().as_secs_f64();
     out.push(Row::new("*", "summary", total, format!("{} tables, {} views, {:.1}s, {:.0} rows/s", tables.len(), views.len(), secs, total as f64 / secs.max(0.001))));
     out.extend(warnings.iter().map(|w| Row::warn(w)));
+    crate::core::runlog::finish(true)?;
     Ok(out)
 }
 

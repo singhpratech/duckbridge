@@ -182,6 +182,51 @@ struct ImportArgs {
     /// Create tables without constraints and add PRIMARY KEY/UNIQUE after the copy (fastest for billions of rows; FKs skipped)
     #[arg(long)]
     keys_after_load: bool,
+    /// Transaction isolation for the source reads: read-committed | read-uncommitted | snapshot
+    #[arg(long, default_value = "read-committed")]
+    isolation: String,
+    /// SET LOCK_TIMEOUT for every source connection, in ms (-1 waits forever)
+    #[arg(long, default_value_t = 1000)]
+    lock_timeout: i64,
+    /// Check sys.dm_tran_locks for X/IX/Sch-M locks before reading each table
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    lock_check: bool,
+    /// How long to wait for other sessions' locks to clear before --on-lock applies, in seconds
+    #[arg(long, default_value_t = 30)]
+    lock_wait: u64,
+    /// What to do when a table stays locked: fail | skip
+    #[arg(long, default_value = "fail")]
+    on_lock: String,
+    /// Re-read a table whose row count / last update / modify date changed during the read, up to this many times
+    #[arg(long, default_value_t = 2)]
+    max_rereads: u32,
+    /// Write what was read (rows, fingerprints before/after, timings) as CSV plus a JSON copy
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    /// Connect with ApplicationIntent=ReadOnly (routes to a readable secondary when one exists)
+    #[arg(long)]
+    readonly: bool,
+    /// Poll this T-SQL until it returns 1/true before starting (e.g. an upstream job's completion flag)
+    #[arg(long)]
+    wait_for: Option<String>,
+    /// Give up on --wait-for after this many seconds
+    #[arg(long, default_value_t = 3600)]
+    wait_timeout: u64,
+    /// Append one line per statement and event to this file
+    #[arg(long)]
+    log: Option<PathBuf>,
+    /// Write a JSON summary to this file
+    #[arg(long)]
+    summary: Option<PathBuf>,
+}
+
+impl ImportArgs {
+    fn safety(&self) -> Result<duckbridge::mssql::fingerprint::ReadSafety> {
+        use duckbridge::mssql::fingerprint::*;
+        let mut s = ReadSafety { lock_timeout_ms: self.lock_timeout, isolation: Isolation::parse(&self.isolation)?, lock_check: self.lock_check, lock_wait_s: self.lock_wait, on_lock: OnLock::parse(&self.on_lock)?, max_rereads: self.max_rereads, readonly_intent: self.readonly, manifest: self.manifest.clone(), wait_for: self.wait_for.clone(), wait_timeout_s: self.wait_timeout };
+        if self.nolock && self.isolation == "read-committed" { s.isolation = Isolation::ReadUncommitted; }
+        Ok(s)
+    }
 }
 
 #[derive(Args)]
@@ -394,7 +439,7 @@ fn transpile_cmd(a: TranspileArgs) -> Result<()> {
     let (from, to): (Dialect, Dialect) = (a.from.into(), a.to.into());
     let default = match (from, to) { (Dialect::Tsql, _) => [("dbo", "main")], (_, Dialect::Tsql) => [("main", "dbo")], _ => [("main", "public")] };
     let sm = schema_map(&a.schema_map, &default);
-    let opts = transpile::Options { target_version: a.target_version, prelude: !a.no_prelude, nocase: a.nocase, float_division: true };
+    let opts = transpile::Options { target_version: a.target_version, prelude: !a.no_prelude, nocase: a.nocase, float_division: true, ..transpile::Options::default() };
     let out = transpile::translate_with(&sql, from, to, &sm, &opts)?;
     match a.out {
         Some(p) => { std::fs::write(&p, &out.sql)?; eprintln!("wrote {}", p.display()); }
@@ -435,17 +480,25 @@ fn run(a: RunArgs, q: bool) -> Result<()> {
 }
 
 fn import(a: ImportArgs, q: bool) -> Result<()> {
+    duckbridge::core::runlog::init(a.log.as_deref(), a.summary.as_deref(), false, 10);
+    let r = import_inner(a, q);
+    let _ = duckbridge::core::runlog::finish(r.is_ok());
+    r
+}
+
+fn import_inner(a: ImportArgs, q: bool) -> Result<()> {
     use duckbridge::mssql::import::*;
     if a.out.exists() { if a.overwrite { std::fs::remove_file(&a.out)?; let _ = std::fs::remove_file(format!("{}.wal", a.out.display())); } else { bail!("{} exists; use --overwrite", a.out.display()); } }
     let target = a.conn.target(&a.database);
-    let opts = ImportOptions { keys_after_load: a.keys_after_load, include: a.tables, exclude: a.exclude, parallel: a.parallel.unwrap_or_else(num_cpus::get), split_threshold: a.split_threshold, batch_rows: a.batch_rows, schema_map: schema_map(&a.schema_map, &[("dbo", "main")]), nolock: a.nolock };
+    let safety = a.safety()?;
+    let opts = ImportOptions { keys_after_load: a.keys_after_load, include: a.tables.clone(), exclude: a.exclude.clone(), parallel: a.parallel.unwrap_or_else(num_cpus::get), split_threshold: a.split_threshold, batch_rows: a.batch_rows, schema_map: schema_map(&a.schema_map, &[("dbo", "main")]), nolock: a.nolock };
     let rt = mssql::runtime()?;
     let mut warnings = vec![];
     let (tables, views) = rt.block_on(async {
-        let mut c = target.connect(&a.database).await?;
+        let mut c = duckbridge::mssql::fingerprint::connect(&target, &a.database, &safety).await?;
         let v = c.simple_query("SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(50)), CAST(SERVERPROPERTY('Edition') AS NVARCHAR(100))").await?.into_first_result().await?;
         if let Some(r) = v.first() { log(q, format!("SQL Server {} ({})", r.get::<&str, _>(0).unwrap_or("?"), r.get::<&str, _>(1).unwrap_or("?"))); }
-        read_catalog(&mut c, &opts, &mut warnings).await
+        read_catalog_with(&mut c, &opts, &safety, &mut warnings).await
     })?;
     let total_rows: i64 = tables.iter().map(|t| t.row_count).sum();
     log(q, format!("{} tables, {} views, ~{} rows", tables.len(), views.len(), total_rows));
@@ -457,9 +510,11 @@ fn import(a: ImportArgs, q: bool) -> Result<()> {
     if !a.schema_only {
         let qq = q;
         let progress: Arc<dyn Fn(&str, i64) + Send + Sync> = Arc::new(move |t, n| log(qq, format!("  {t}: {n} rows")));
-        let rep = copy_data(&con, &target, &tables, &opts, progress)?;
+        let rep = copy_data_with(&con, &target, &tables, &opts, &safety, progress)?;
         warnings.extend(rep.warnings);
         log(q, format!("copied {} rows in {:.1}s ({:.0} rows/s)", rep.rows, rep.seconds, rep.rows as f64 / rep.seconds.max(0.001)));
+        if let Some(m) = &safety.manifest { log(q, format!("manifest: {} (+ .json), {} table(s), {} re-read(s)", m.display(), rep.manifest.len(), rep.manifest.iter().map(|r| r.rereads as u64).sum::<u64>())); }
+        for m in &rep.manifest { duckbridge::core::runlog::summary_add(duckbridge::core::runlog::SummaryEntry { table: m.table.clone(), job: "import".into(), rows: m.rows_read, seconds: m.seconds, strategy: m.isolation.clone(), checks: vec![format!("fingerprint before {}", m.fingerprint_before), format!("after {}", m.fingerprint_after), format!("rereads {}", m.rereads)], ok: m.rows_read >= 0 }); }
         add_keys(&con, &tables, &opts, &mut warnings)?;
     }
     create_duck_views(&con, &views, &opts, &mut warnings);
