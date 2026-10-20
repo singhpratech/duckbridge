@@ -338,6 +338,7 @@ pub async fn recreate_indexes(c: &mut MsClient, ddl: &[String], job: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::duck;
     use crate::mssql::target::*;
 
     #[test]
@@ -413,8 +414,8 @@ mod tests {
             let t = read_target_tables(&mut c, &[("dbo".into(), "t".into())]).await.unwrap().remove(0);
             assert!(t.partitioning.is_some());
 
-            let con = duckdb::Connection::open_in_memory().unwrap();
-            con.execute_batch("CREATE TABLE t (mkt VARCHAR NOT NULL, id INTEGER NOT NULL, v VARCHAR, PRIMARY KEY (mkt, id));
+            let con = duck::open_in_memory().unwrap();
+            duck::exec(&con, "CREATE TABLE t (mkt VARCHAR NOT NULL, id INTEGER NOT NULL, v VARCHAR, PRIMARY KEY (mkt, id));
                 INSERT INTO t SELECT CASE WHEN i % 4 = 0 THEN 'AAA' WHEN i % 4 = 1 THEN 'BBB' ELSE 'CCC' END, i, 'v' || i FROM range(200) r(i);").unwrap();
             let cat = crate::core::catalog::read_catalog(&con, "test", &Default::default()).unwrap();
             let splits = crate::mssql::jobs::parse_splits(&["t=column:mkt".into()]).unwrap();
@@ -422,7 +423,7 @@ mod tests {
             let plan = crate::mssql::jobs::plan_jobs(&con, &cat, &splits, &sts, crate::mssql::jobs::Strategy::Serial, 1_000_000, 4).unwrap();
             assert_eq!(plan.jobs.len(), 3);
             let values = |sql: &str| -> String {
-                con.query_row(&format!("SELECT string_agg(format('(''{{}}'', {{}}, ''{{}}'')', mkt, id, v), ', ') FROM ({sql})"), [], |r| r.get(0)).unwrap()
+                duck::query_scalar(&con, &format!("SELECT string_agg(format('(''{{}}'', {{}}, ''{{}}'')', mkt, id, v), ', ') FROM ({sql})")).unwrap()
             };
             async fn load(c: &mut MsClient, t: &TargetTable, job: &Job, vals: &str, expected: i64, replace: bool) -> Result<Staging> {
                 let mut s = prepare_staging(c, t, job).await?;

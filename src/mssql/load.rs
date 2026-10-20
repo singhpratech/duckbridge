@@ -7,7 +7,7 @@ use crate::core::script::select_sql;
 use crate::core::typemap::quote_duck;
 use super::split::ranges;
 use anyhow::{Context, Result};
-use duckdb::Connection;
+use crate::core::duck::{self, Connection};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -132,7 +132,7 @@ pub fn load_data(con: &Connection, cat: &Catalog, target: &MssqlTarget, em: &Emi
         let key = split_key(t);
         if let (Some(k), true) = (&key, t.row_count >= o.split_threshold && o.parallel > 1) {
             let fq = format!("{}.{}", quote_duck(&t.schema), quote_duck(&t.name));
-            let (mn, mx): (Option<i64>, Option<i64>) = con.query_row(&format!("SELECT CAST(min({0}) AS BIGINT), CAST(max({0}) AS BIGINT) FROM {fq}", quote_duck(k)), [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (mn, mx): (Option<i64>, Option<i64>) = duck::query_one(con, &format!("SELECT CAST(min({0}) AS BIGINT), CAST(max({0}) AS BIGINT) FROM {fq}", quote_duck(k)), |r| Ok((r.get(0)?, r.get(1)?)))?;
             let n = ((t.row_count / o.split_threshold.max(1)) as usize + 1).clamp(2, o.parallel * 2);
             for r in ranges(mn.unwrap_or(0) as i128, mx.unwrap_or(0) as i128, n) { jobs.push(Job { table: i, key: Some(k.clone()), range: Some(r) }); }
         } else {

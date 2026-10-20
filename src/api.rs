@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use duckdb::Connection;
+use crate::core::duck::{self, Connection};
 
 use crate::core::catalog::{read_catalog, CatalogOptions};
 use crate::core::emit::{Emitter, Flavor};
@@ -178,8 +178,8 @@ pub fn import_mssql(con: &Connection, dsn: &Dsn, r: &ImportRequest) -> Result<Ve
     if r.overwrite {
         use crate::core::typemap::quote_duck;
         let mapped = |s: &str| opts.schema_map.get(s).cloned().unwrap_or_else(|| s.to_string());
-        for v in &views { con.execute_batch(&format!("DROP VIEW IF EXISTS {}.{}", quote_duck(&mapped(&v.schema)), quote_duck(&v.name)))?; }
-        for t in &tables { con.execute_batch(&format!("DROP TABLE IF EXISTS {}.{} CASCADE", quote_duck(&mapped(&t.schema)), quote_duck(&t.name)))?; }
+        for v in &views { duck::exec(con, &format!("DROP VIEW IF EXISTS {}.{}", quote_duck(&mapped(&v.schema)), quote_duck(&v.name)))?; }
+        for t in &tables { duck::exec(con, &format!("DROP TABLE IF EXISTS {}.{} CASCADE", quote_duck(&mapped(&t.schema)), quote_duck(&t.name)))?; }
     }
     create_duck_schema(con, &tables, &views, &opts, &mut warnings)?;
     let mut out = vec![];
@@ -197,7 +197,7 @@ pub fn import_mssql(con: &Connection, dsn: &Dsn, r: &ImportRequest) -> Result<Ve
     }
     create_duck_views(con, &views, &opts, &mut warnings);
     // Flush the WAL now: inside the extension the host may never close the instance itself.
-    let _ = con.execute_batch("CHECKPOINT");
+    let _ = duck::exec(con, "CHECKPOINT");
     for t in &tables {
         let schema = opts.schema_map.get(&t.schema).cloned().unwrap_or_else(|| t.schema.clone());
         out.push(Row::new(format!("{schema}.{}", t.name), "table", if r.schema_only { 0 } else { t.row_count }, if r.schema_only { "schema only" } else { "" }));
@@ -546,7 +546,7 @@ pub fn run_script(con: &Connection, sql: &str, r: &RunRequest) -> Result<Vec<Row
         for p in transpile::duckdb_prelude_for(mode) {
             // keep the compatibility settings local to this session
             let s = p.trim_start().strip_prefix("SET ").map(|rest| format!("SET SESSION {rest}")).unwrap_or_else(|| p.to_string());
-            con.execute_batch(&s)?;
+            duck::exec(con, &s)?;
         }
         if r.mssql_math { crate::mathcompat::install(con)?; }
     }
@@ -558,9 +558,10 @@ pub fn run_script(con: &Connection, sql: &str, r: &RunRequest) -> Result<Vec<Row
         let up = s.to_uppercase();
         let t0 = std::time::Instant::now();
         let res: Result<i64> = if up.starts_with("SELECT") || up.starts_with("WITH") || up.starts_with("FROM") {
-            (|| { let mut st = con.prepare(&s)?; let mut rows = st.query([])?; let mut n = 0i64; while rows.next()?.is_some() { n += 1; } Ok(n) })()
+            let mut n = 0i64;
+            duck::for_each_row(con, &s, |_| { n += 1; Ok(()) }).map(|_| n)
         } else {
-            con.execute(&s, []).map(|n| n as i64).map_err(|e| e.into())
+            duck::execute(con, &s).map(|n| n as i64)
         };
         match res {
             Ok(n) => out.push(Row::new(label, "ok", n, format!("{:.2}s", t0.elapsed().as_secs_f64()))),
@@ -571,7 +572,7 @@ pub fn run_script(con: &Connection, sql: &str, r: &RunRequest) -> Result<Vec<Row
             }
         }
     }
-    let _ = con.execute_batch("CHECKPOINT");
+    let _ = duck::exec(con, "CHECKPOINT");
     let ok = out.iter().filter(|r| r.kind == "ok").count();
     out.push(Row::new("*", "summary", ok as i64, format!("{ok} statement(s) succeeded, {failed} failed")));
     Ok(out)

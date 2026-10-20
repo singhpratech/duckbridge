@@ -6,7 +6,7 @@
 //! * `literal`: string literals of a script (`WHERE col = 'Active'`) that match rows only case-insensitively.
 use crate::transpile::tokens::{tokenize, Kind};
 use anyhow::Result;
-use duckdb::Connection;
+use crate::core::duck::{self, Connection};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AuditRow {
@@ -25,16 +25,15 @@ fn ql(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 
 /// String columns: (schema, table, column).
 fn string_columns(con: &Connection, tables: &[String], columns: &[String]) -> Result<Vec<(String, String, String)>> {
-    let mut st = con.prepare(
+    let rows = duck::query_rows(con,
         "SELECT table_schema, table_name, column_name FROM information_schema.columns \
          WHERE table_catalog = current_database() AND table_schema NOT IN ('information_schema', 'pg_catalog') \
-         AND (data_type = 'VARCHAR' OR data_type LIKE 'VARCHAR(%') ORDER BY table_schema, table_name, ordinal_position")?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+         AND (data_type = 'VARCHAR' OR data_type LIKE 'VARCHAR(%') ORDER BY table_schema, table_name, ordinal_position",
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
     let want_t: Vec<String> = tables.iter().map(|t| t.to_lowercase()).collect();
     let want_c: Vec<String> = columns.iter().map(|c| c.to_lowercase()).collect();
     let mut out = vec![];
-    for r in rows {
-        let (s, t, c) = r?;
+    for (s, t, c) in rows {
         let (tl, full) = (t.to_lowercase(), format!("{}.{}", s, t).to_lowercase());
         if !want_t.is_empty() && !want_t.iter().any(|w| *w == tl || *w == full) { continue; }
         if !want_c.is_empty() && !want_c.iter().any(|w| *w == c.to_lowercase() || *w == format!("{tl}.{}", c.to_lowercase())) { continue; }
@@ -67,11 +66,9 @@ pub fn audit_ci(con: &Connection, tables: &[String], columns: &[String], script:
             "WITH g AS (SELECT lower(rtrim({col}, ' ')) AS k, count(DISTINCT {col}) AS n, count(DISTINCT lower({col})) AS nl, count(DISTINCT rtrim({col}, ' ')) AS nr \
              FROM {rel} WHERE {col} IS NOT NULL GROUP BY 1 HAVING count(DISTINCT {col}) > 1) \
              SELECT k, nl < n OR nr >= n AS by_case, nr < n AS by_space, count(*) OVER () AS total FROM g ORDER BY k LIMIT 5");
-        let mut st = con.prepare(&sql)?;
-        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, r.get::<_, bool>(2)?, r.get::<_, i64>(3)?)))?;
+        let rows = duck::query_rows(con, &sql, |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, r.get::<_, bool>(2)?, r.get::<_, i64>(3)?)))?;
         let (mut case_ex, mut space_ex, mut total) = (vec![], vec![], 0i64);
-        for r in rows {
-            let (k, by_case, by_space, n) = r?;
+        for (k, by_case, by_space, n) in rows {
             total = n;
             if by_case { case_ex.push(k.clone()); }
             if by_space { space_ex.push(k); }
@@ -81,7 +78,7 @@ pub fn audit_ci(con: &Connection, tables: &[String], columns: &[String], script:
         // literals of the script that match this column only case-/space-insensitively
         for lit in &lits {
             let sql = format!("SELECT count(*) FROM {rel} WHERE lower(rtrim({col}, ' ')) = lower(rtrim({l}, ' ')) AND {col} <> {l}", l = ql(lit));
-            let n: i64 = con.query_row(&sql, [], |r| r.get(0))?;
+            let n: i64 = duck::query_scalar(con, &sql)?;
             if n > 0 { out.push(AuditRow { table: format!("{s}.{t}"), column: c.clone(), kind: "literal".into(), examples: vec![lit.clone()], count: n }); }
         }
     }
@@ -94,8 +91,8 @@ mod tests {
 
     #[test]
     fn audit_finds_case_space_and_literal_collisions() {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch(
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, 
             "CREATE TABLE customers (id INTEGER, status VARCHAR, city VARCHAR, code VARCHAR);
              INSERT INTO customers VALUES (1, 'Active', 'Paris', 'A1'), (2, 'active', 'Paris', 'A1'), (3, 'ACTIVE', 'paris ', 'B2'),
                                           (4, 'Closed', 'Lyon', 'C3'), (5, 'Closed ', 'Lyon', NULL);

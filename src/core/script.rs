@@ -3,8 +3,7 @@ use super::emit::{Emitter, Flavor, Literal};
 use super::model::*;
 use super::typemap::quote_duck;
 use anyhow::Result;
-use duckdb::types::{TimeUnit, ValueRef};
-use duckdb::Connection;
+use super::duck::{Connection, TimeUnit, ValueRef};
 use std::io::Write;
 
 pub struct ScriptOptions {

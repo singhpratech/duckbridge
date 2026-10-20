@@ -18,7 +18,7 @@ use crate::core::script::select_sql;
 use crate::core::typemap::quote_duck;
 use super::split::ranges;
 use anyhow::{bail, Context, Result};
-use duckdb::Connection;
+use crate::core::duck::{self, Connection};
 use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -211,7 +211,7 @@ fn table_jobs(con: &Connection, t: &Table, ti: usize, spec: &SplitSpec, split_th
     };
     let auto_n = || ((t.row_count / split_threshold.max(1)) as usize + 1).clamp(2, (parallel * 2).max(2));
     let range_jobs = |col: &Column, n: usize| -> Result<Vec<(String, Job)>> {
-        let (mn, mx): (Option<i64>, Option<i64>) = con.query_row(&format!("SELECT CAST(min({0}) AS BIGINT), CAST(max({0}) AS BIGINT) FROM {fq}", quote_duck(&col.name)), [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (mn, mx): (Option<i64>, Option<i64>) = duck::query_one(con, &format!("SELECT CAST(min({0}) AS BIGINT), CAST(max({0}) AS BIGINT) FROM {fq}", quote_duck(&col.name)), |r| Ok((r.get(0)?, r.get(1)?)))?;
         let rs = ranges(mn.unwrap_or(0) as i128, mx.unwrap_or(0) as i128, n);
         let k = rs.len() as i64;
         Ok(rs.iter().enumerate().map(|(i, r)| {
@@ -245,8 +245,7 @@ fn table_jobs(con: &Connection, t: &Table, ti: usize, spec: &SplitSpec, split_th
             let c = find_col(t, col)?;
             let q = quote_duck(&c.name);
             let sql = format!("SELECT CAST({q} AS VARCHAR) AS v, count(*) AS n FROM {fq} GROUP BY {q} ORDER BY n DESC, v NULLS LAST");
-            let mut stmt = con.prepare(&sql)?;
-            let values: Vec<(Option<String>, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            let values: Vec<(Option<String>, i64)> = duck::query_rows(con, &sql, |r| Ok((r.get(0)?, r.get(1)?)))?;
             if values.len() > MAX_COLUMN_VALUES {
                 bail!("column:{col}: {} distinct values (more than the {MAX_COLUMN_VALUES} partitions SQL Server allows); use hash:{col}:<n> instead", values.len());
             }
@@ -265,8 +264,7 @@ fn files_jobs(con: &Connection, t: &Table, ti: usize, glob: &str) -> Result<Vec<
     let norm = glob.replace('\\', "/");
     let by_dir = norm.ends_with('/');
     let pattern = if by_dir { format!("{norm}**/*.parquet") } else { norm.clone() };
-    let mut stmt = con.prepare(&format!("SELECT file FROM glob({}) ORDER BY file", sql_str(&pattern)))?;
-    let files: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?
+    let files: Vec<String> = duck::query_rows(con, &format!("SELECT file FROM glob({}) ORDER BY file", sql_str(&pattern)), |r| Ok(r.get::<_, String>(0)?))?
         .into_iter().map(|f| f.replace('\\', "/")).collect();
     if files.is_empty() { bail!("files:{glob}: no Parquet files match {pattern:?}"); }
     // static directory prefix of the glob (up to the last '/' before the first wildcard)
@@ -284,7 +282,7 @@ fn files_jobs(con: &Connection, t: &Table, ti: usize, glob: &str) -> Result<Vec<
     for (key, files) in groups {
         let list = format!("[{}]", files.iter().map(|f| sql_str(f)).collect::<Vec<_>>().join(", "));
         let src = format!("read_parquet({list}, hive_partitioning = true)");
-        let est: i64 = con.query_row(&format!("SELECT count(*) FROM {src}"), [], |r| r.get(0)).with_context(|| format!("counting rows of {key}"))?;
+        let est: i64 = duck::query_scalar(con, &format!("SELECT count(*) FROM {src}")).with_context(|| format!("counting rows of {key}"))?;
         let source_sql = format!("SELECT {} FROM (SELECT {} FROM {src}) AS src", outer_cols.join(", "), inner_cols.join(", "));
         // Hive value: last `k=v` directory component of the group (directory mode) or of the file's parent
         let dir = if by_dir { key.as_str() } else { key.rsplit_once('/').map(|(d, _)| d).unwrap_or("") };
@@ -708,12 +706,12 @@ mod tests {
     }
 
     fn total(con: &Connection, sqls: &[&str]) -> i64 {
-        sqls.iter().map(|s| con.query_row(&format!("SELECT count(*) FROM ({s})"), [], |r| r.get::<_, i64>(0)).unwrap()).sum()
+        sqls.iter().map(|s| duck::query_scalar::<i64>(con, &format!("SELECT count(*) FROM ({s})")).unwrap()).sum()
     }
 
     fn setup() -> (Connection, Catalog) {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch("CREATE TABLE kpi (mkt VARCHAR(3) NOT NULL, id INTEGER NOT NULL, v DOUBLE, d DATE, PRIMARY KEY (mkt, id));
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, "CREATE TABLE kpi (mkt VARCHAR(3) NOT NULL, id INTEGER NOT NULL, v DOUBLE, d DATE, PRIMARY KEY (mkt, id));
             INSERT INTO kpi SELECT CASE WHEN i % 10 < 5 THEN 'AAA' WHEN i % 10 < 8 THEN 'BBB' ELSE 'C''C' END, i, i * 1.5, DATE '2024-01-01' + (i % 3)::INT FROM range(1000) t(i);
             CREATE TABLE small (id INTEGER PRIMARY KEY, s VARCHAR); INSERT INTO small VALUES (1, 'x'), (2, NULL);
             CREATE TABLE empty_t (id INTEGER);
@@ -764,8 +762,8 @@ mod tests {
 
     #[test]
     fn switch_rejects_case_only_values() {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch("CREATE TABLE t (m VARCHAR, id INTEGER); INSERT INTO t VALUES ('ab', 1), ('AB', 2);").unwrap();
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, "CREATE TABLE t (m VARCHAR, id INTEGER); INSERT INTO t VALUES ('ab', 1), ('AB', 2);").unwrap();
         let cat = read_catalog(&con, "test", &CatalogOptions::default()).unwrap();
         let splits = parse_splits(&["t=column:m".into()]).unwrap();
         assert!(plan_jobs(&con, &cat, &splits, &HashMap::new(), Strategy::Serial, 1, 4).is_ok());
@@ -784,7 +782,7 @@ mod tests {
         assert_eq!(total(&con, &kj.iter().map(|j| j.source_sql.as_str()).collect::<Vec<_>>()), 1000);
         // every row exactly once: the union without duplicates has as many rows as the table
         let union = kj.iter().map(|j| j.source_sql.clone()).collect::<Vec<_>>().join(" UNION ALL ");
-        let distinct: i64 = con.query_row(&format!("SELECT count(DISTINCT (mkt, id)) FROM ({union})"), [], |r| r.get(0)).unwrap();
+        let distinct: i64 = duck::query_scalar(&con, &format!("SELECT count(DISTINCT (mkt, id)) FROM ({union})")).unwrap();
         assert_eq!(distinct, 1000);
 
         // auto: big (5000 rows, BIGINT pk) splits into ranges at threshold 1000, kpi (composite pk) does not
@@ -810,7 +808,7 @@ mod tests {
         let (con, cat) = setup();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("kpi").to_string_lossy().replace('\\', "/");
-        con.execute_batch(&format!("COPY (SELECT * FROM kpi) TO '{dir}' (FORMAT PARQUET, PARTITION_BY (mkt));")).unwrap();
+        duck::exec(&con, &format!("COPY (SELECT * FROM kpi) TO '{dir}' (FORMAT PARQUET, PARTITION_BY (mkt));")).unwrap();
         let k = ti(&cat, "kpi");
         // per Hive directory
         let plan = plan_jobs(&con, &cat, &parse_splits(&[format!("kpi=files:{dir}/mkt=*/")]).unwrap(), &HashMap::new(), Strategy::Serial, 1_000_000, 4).unwrap();
@@ -823,9 +821,9 @@ mod tests {
         assert_eq!(kj[0].id, "main.kpi#AAA");
         assert_eq!(total(&con, &kj.iter().map(|j| j.source_sql.as_str()).collect::<Vec<_>>()), 1000);
         // the job query returns the table's columns in catalog order with the catalog types
-        let (m, n, ty): (String, i64, String) = con.query_row(&format!("SELECT first(mkt), count(*), first(typeof(d)) FROM ({}) WHERE mkt = 'BBB'", kj[1].source_sql), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let (m, n, ty): (String, i64, String) = duck::query_one(&con, &format!("SELECT first(mkt), count(*), first(typeof(d)) FROM ({}) WHERE mkt = 'BBB'", kj[1].source_sql), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         assert_eq!((m.as_str(), n, ty.as_str()), ("BBB", 300, "DATE"));
-        let cols: Vec<String> = { let mut st = con.prepare(&format!("DESCRIBE {}", kj[0].source_sql)).unwrap(); st.query_map([], |r| r.get::<_, String>(0)).unwrap().map(|r| r.unwrap()).collect() };
+        let cols: Vec<String> = duck::query_rows(&con, &format!("DESCRIBE {}", kj[0].source_sql), |r| Ok(r.get::<_, String>(0)?)).unwrap();
         assert_eq!(cols, vec!["mkt", "id", "v", "d"]);
         // per file
         let plan = plan_jobs(&con, &cat, &parse_splits(&[format!("kpi=files:{dir}/*/*.parquet")]).unwrap(), &HashMap::new(), Strategy::Serial, 1_000_000, 4).unwrap();

@@ -9,17 +9,16 @@
 use super::convert::Converter;
 use super::MsClient;
 use anyhow::{anyhow, bail, Context, Result};
-use duckdb::arrow::array::{
+use crate::core::duck::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array, Decimal32Array, Decimal64Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, IntervalMonthDayNanoArray,
     LargeBinaryArray, LargeStringArray, StringArray, StringViewArray, Time64MicrosecondArray, Time64NanosecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array,
     UInt64Array, UInt8Array,
 };
-use duckdb::arrow::buffer::NullBuffer;
-use duckdb::arrow::datatypes::{DataType, IntervalUnit, TimeUnit as ArrowUnit};
-use duckdb::types::{TimeUnit, ValueRef};
-use duckdb::Connection;
+use crate::core::duck::arrow::buffer::NullBuffer;
+use crate::core::duck::arrow::datatypes::{DataType, IntervalUnit, TimeUnit as ArrowUnit};
+use crate::core::duck::{self, Connection, TimeUnit, ValueRef};
 use std::fmt;
 use std::time::Instant;
 use tiberius::{ColumnData, MetaDataColumn, SortOrder, SqlBulkCopyOption, SqlBulkCopyOptions, TokenRow, TypeInfo, VarLenType};
@@ -490,8 +489,8 @@ fn convert_column(a: &ArrayRef, conv: &Converter, rows: &mut [TokenRow<'static>]
 /// errors are [`ConvertError`]s. Returns the number of rows read.
 pub(crate) fn read_rows(con: &Connection, sql: &str, convs: &[Converter], batch_rows: usize, sink: &mut dyn FnMut(Vec<TokenRow<'static>>) -> Result<()>) -> Result<i64> {
     let batch_rows = batch_rows.max(1);
-    let mut stmt = con.prepare(sql).with_context(|| format!("preparing {}", sql.chars().take(300).collect::<String>()))?;
-    let schema = stmt.stream_arrow([]).with_context(|| format!("running {}", sql.chars().take(300).collect::<String>()))?.get_schema();
+    let mut stream = duck::stream(con, sql)?;
+    let schema = stream.schema().clone();
     let fields = schema.fields();
     if fields.len() != convs.len() {
         bail!("the source query returns {} columns but {} converters were given", fields.len(), convs.len());
@@ -500,7 +499,7 @@ pub(crate) fn read_rows(con: &Connection, sql: &str, convs: &[Converter], batch_
     let mut total = 0i64;
     let mut pending: Vec<TokenRow<'static>> = Vec::with_capacity(batch_rows.min(MAX_CHUNK_ROWS) + 2048);
     if fields.iter().all(|f| has_fast_path(f.data_type())) {
-        while let Some(chunk) = stmt.step()? {
+        while let Some(chunk) = stream.next_chunk()? {
             let n = chunk.len();
             if n == 0 { continue; }
             let base = pending.len();
@@ -515,7 +514,7 @@ pub(crate) fn read_rows(con: &Connection, sql: &str, convs: &[Converter], batch_
             }
         }
     } else {
-        let mut rows = stmt.raw_query();
+        let mut rows = stream.rows();
         while let Some(row) = rows.next()? {
             let mut tr = TokenRow::with_capacity(ncols);
             for (c, conv) in convs.iter().enumerate() {
@@ -536,7 +535,7 @@ mod tests {
     use super::*;
 
     fn mixed_table(con: &Connection, n: i64) {
-        con.execute_batch(&format!(
+        duck::exec(con, &format!(
             "CREATE TABLE t AS SELECT i AS id,
                 CASE WHEN i % 7 = 0 THEN NULL ELSE 'name_' || i END AS name,
                 CAST((i % 1000) * 0.01 AS DECIMAL(8,5)) AS amount,
@@ -557,7 +556,7 @@ mod tests {
 
     #[test]
     fn bulk_read_rows_mixed_types() {
-        let con = Connection::open_in_memory().unwrap();
+        let con = duck::open_in_memory().unwrap();
         mixed_table(&con, 10_000);
         let mut batches = 0;
         let mut seen = 0usize;
@@ -597,8 +596,8 @@ mod tests {
 
     #[test]
     fn bulk_read_rows_reports_column_and_row() {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch("CREATE TABLE t AS SELECT i AS id, CAST(i AS INTEGER) AS v FROM range(5000) r(i)").unwrap();
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, "CREATE TABLE t AS SELECT i AS id, CAST(i AS INTEGER) AS v FROM range(5000) r(i)").unwrap();
         let cv = vec![Converter::BigInt, Converter::TinyInt];
         let e = read_rows(&con, "SELECT id, v FROM t ORDER BY id", &cv, 1000, &mut |_| Ok(())).unwrap_err();
         let ce = e.downcast_ref::<ConvertError>().expect("a ConvertError");
@@ -610,7 +609,7 @@ mod tests {
 
     #[test]
     fn bulk_read_rows_row_fallback_and_sink_errors() {
-        let con = Connection::open_in_memory().unwrap();
+        let con = duck::open_in_memory().unwrap();
         // LIST has no columnar fast path: the row path converts it as text
         let cv = vec![Converter::Int, Converter::Text];
         let mut got = vec![];
@@ -647,9 +646,9 @@ mod tests {
         let (host, port, user, password) = (it.next().unwrap().to_string(), it.next().unwrap().parse().unwrap(), it.next().unwrap().to_string(), it.next().unwrap().to_string());
         let target = crate::mssql::MssqlTarget { host, port, user, password, database: "_agent_c".into(), trust_cert: true, encrypt: false, windows_auth: false };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let con = Connection::open_in_memory().unwrap();
+        let con = duck::open_in_memory().unwrap();
         let n = 25_000;
-        con.execute_batch(&format!(
+        duck::exec(&con, &format!(
             "CREATE TABLE src AS SELECT (i + 1)::INTEGER AS id,
                 CASE WHEN i % 11 = 0 THEN NULL ELSE 'v' || i END AS v,
                 CASE WHEN i % 13 = 0 THEN NULL ELSE 'n\u{e9}\u{4e2d}' || i END AS nv,
@@ -666,8 +665,8 @@ mod tests {
                 i / 3.0 AS f
              FROM range({n}) r(i)")).unwrap();
         // DuckDB-side reference values
-        let (sum_amt, sum_big, nulls_nv, sum_len_nv): (String, String, i64, i64) = con.query_row(
-            "SELECT CAST(sum(amt) AS VARCHAR), CAST(sum(big) AS VARCHAR), count(*) - count(nv), sum(length(nv)) FROM src", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        let (sum_amt, sum_big, nulls_nv, sum_len_nv): (String, String, i64, i64) = duck::query_one(&con,
+            "SELECT CAST(sum(amt) AS VARCHAR), CAST(sum(big) AS VARCHAR), count(*) - count(nv), sum(length(nv)) FROM src", |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
         rt.block_on(async {
             let mut c = target.connect("_agent_c").await.unwrap();
             crate::mssql::exec_batch(&mut c, "DROP TABLE IF EXISTS dbo.c_bulk;
@@ -703,12 +702,12 @@ mod tests {
                                  OR t7 <> CAST(dt2 AS TIME(7)) OR (sdt IS NOT NULL AND sdt <> CAST(dt2 AS SMALLDATETIME)) OR CAST(dto AS DATETIME2(7)) <> dt2
                                  OR DATEPART(TZOFFSET, dto) <> 0").await, "0");
             assert_eq!(q(&mut c, "SELECT CAST(COUNT(*) AS NVARCHAR(20)) FROM dbo.c_bulk WHERE sdt IS NULL").await,
-                       con.query_row("SELECT count(*) FROM src WHERE ts >= TIMESTAMP '2079-06-06'", [], |r| r.get::<_, i64>(0)).unwrap().to_string());
+                       duck::query_scalar::<i64>(&con, "SELECT count(*) FROM src WHERE ts >= TIMESTAMP '2079-06-06'").unwrap().to_string());
             // one row, every column as text
             let id = 12_345;
             type Row7 = (Option<String>, Option<String>, String, String, String, String, String);
-            let (v, nv, c3, amt, d, ts, g): Row7 = con.query_row(
-                &format!("SELECT v, nv, c3, CAST(amt AS VARCHAR), CAST(d AS VARCHAR), strftime(ts, '%Y-%m-%d %H:%M:%S.%f'), g::VARCHAR FROM src WHERE id = {id}"), [],
+            let (v, nv, c3, amt, d, ts, g): Row7 = duck::query_one(&con,
+                &format!("SELECT v, nv, c3, CAST(amt AS VARCHAR), CAST(d AS VARCHAR), strftime(ts, '%Y-%m-%d %H:%M:%S.%f'), g::VARCHAR FROM src WHERE id = {id}"),
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).unwrap();
             let got = q(&mut c, &format!("SELECT CONCAT_WS('|', ISNULL(v, '~'), ISNULL(nv, N'~'), c3, CAST(amt AS NVARCHAR(20)), CONVERT(NVARCHAR(10), d, 23),
                 CONVERT(NVARCHAR(27), dt2, 121), LOWER(CAST(g AS NVARCHAR(36))), CAST(tiny AS NVARCHAR(3)), CAST(flag AS NVARCHAR(1))) FROM dbo.c_bulk WHERE id = {id}")).await;
@@ -717,10 +716,10 @@ mod tests {
             assert_eq!(got, want);
             assert_eq!(q(&mut c, "SELECT CAST(COUNT(*) AS NVARCHAR(20)) FROM dbo.c_bulk WHERE f <> CAST(id - 1 AS FLOAT) / 3.0 OR (bin IS NOT NULL AND bin <> CAST('b' + CAST(id - 1 AS VARCHAR(10)) AS VARBINARY(16)))").await, "0");
             assert_eq!(q(&mut c, "SELECT CAST(SUM(CAST(money_v AS DECIMAL(19,4))) AS NVARCHAR(40)) FROM dbo.c_bulk").await,
-                       con.query_row("SELECT CAST(CAST(sum(money_v) AS DECIMAL(19,4)) AS VARCHAR) FROM src", [], |r| r.get::<_, String>(0)).unwrap());
+                       duck::query_scalar::<String>(&con, "SELECT CAST(CAST(sum(money_v) AS DECIMAL(19,4)) AS VARCHAR) FROM src").unwrap());
 
             // a conversion error: names table, column and row; the open batch is not committed
-            con.execute_batch("CREATE TABLE bad AS SELECT i::INTEGER AS id, CASE WHEN i = 3000 THEN 'caf\u{e9}' ELSE 'ok' END AS v FROM range(5000) r(i)").unwrap();
+            duck::exec(&con, "CREATE TABLE bad AS SELECT i::INTEGER AS id, CASE WHEN i = 3000 THEN 'caf\u{e9}' ELSE 'ok' END AS v FROM range(5000) r(i)").unwrap();
             crate::mssql::exec_batch(&mut c, "DROP TABLE IF EXISTS dbo.c_bad; CREATE TABLE dbo.c_bad (id INT NOT NULL, v VARCHAR(10) NOT NULL)").await.unwrap();
             let mut c2 = target.connect("_agent_c").await.unwrap();
             let o = BulkOptions { batch_rows: 1_000, keep_identity: false, table_lock: false, prefetch_batches: 2, order_by: None, check_constraints: true };
@@ -738,7 +737,7 @@ mod tests {
                 c NVARCHAR(MAX) NULL, d VARBINARY(MAX) NULL, e CHAR(10) NOT NULL, f NCHAR(4) NULL, g DECIMAL(38,10) NULL, h SMALLDATETIME NOT NULL,
                 i DATETIME NULL, j REAL NULL, k SMALLINT NULL, l BIGINT NULL, m SMALLMONEY NULL, n NUMERIC(5,0) NULL, o BINARY(4) NULL, p NVARCHAR(MAX) NULL, q NTEXT NULL,
                 r DATETIME2(0) NULL)").await.unwrap();
-            con.execute_batch("CREATE TABLE ty AS SELECT repeat('\u{e9}', 1500 + i::INTEGER) AS a, repeat('x', 10000) AS b, repeat('\u{4e2d}', 5000) AS c,
+            duck::exec(&con, "CREATE TABLE ty AS SELECT repeat('\u{e9}', 1500 + i::INTEGER) AS a, repeat('x', 10000) AS b, repeat('\u{4e2d}', 5000) AS c,
                 encode(repeat('z', 9000)) AS d, 'ab' AS e, 'n\u{e9}' AS f, CAST('1234567890123456789012345678.0123456789' AS DECIMAL(38,10)) AS g,
                 TIMESTAMP '2001-02-03 04:05:29.999' AS h, TIMESTAMP '1753-01-01 00:00:00.001' AS i, 1.5::FLOAT AS j, (-i)::SMALLINT AS k,
                 9007199254740993::BIGINT AS l, 214748.3647::DECIMAL(10,4) AS m, 99999 AS n, '\x01\x02'::BLOB AS o, '<r a=\"1\"/>' AS p, 'nt\u{e9}' AS q,
@@ -781,7 +780,7 @@ mod tests {
         let (host, port, user, password) = (it.next().unwrap().to_string(), it.next().unwrap().parse().unwrap(), it.next().unwrap().to_string(), it.next().unwrap().to_string());
         let target = crate::mssql::MssqlTarget { host, port, user, password, database: "_agent_c".into(), trust_cert: true, encrypt: false, windows_auth: false };
         let rows: i64 = std::env::var("DUCKBRIDGE_BENCH_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
-        let con = Connection::open_in_memory().unwrap();
+        let con = duck::open_in_memory().unwrap();
         let convs = crate::mssql::convert::tests::bench_table(&con, rows);
         let names: Vec<String> = "v1 v2 v3 v4 v5 v6 c1 c2 i1 i2 i3 i4 i5 amt d t1 t2".split(' ').map(String::from).collect();
         let ddl: Vec<String> = names.iter().zip(crate::mssql::convert::tests::bench_types()).map(|(n, t)| format!("{n} {t} NULL")).collect();

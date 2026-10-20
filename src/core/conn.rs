@@ -8,7 +8,7 @@
 use std::sync::RwLock;
 
 use anyhow::Result;
-use duckdb::Connection;
+use super::duck::Connection;
 
 pub trait ConnProvider: Send + Sync {
     fn acquire(&self) -> Result<Connection>;
@@ -25,7 +25,7 @@ pub fn set_provider(p: Box<dyn ConnProvider>) {
 /// A connection for a worker thread: from the provider if one is installed, else a clone of `base`.
 pub fn acquire(base: &Connection) -> Result<Connection> {
     if let Some(p) = PROVIDER.read().unwrap_or_else(|e| e.into_inner()).as_ref() { return p.acquire(); }
-    Ok(base.try_clone()?)
+    super::duck::try_clone(base)
 }
 
 /// Give a worker connection back (returned to the pool, or simply closed).

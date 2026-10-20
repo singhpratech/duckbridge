@@ -13,7 +13,7 @@ use crate::core::model::{Column, Table};
 use crate::core::runlog::Failure;
 use crate::core::typemap::{parse_type, quote_duck};
 use anyhow::{Context, Result};
-use duckdb::Connection;
+use crate::core::duck::Connection;
 use std::collections::HashMap;
 use tiberius::Row;
 
@@ -1189,6 +1189,7 @@ pub fn staging_nonclustered_ddl(t: &TargetTable, staging: &str, partition_value:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::duck;
     use crate::core::model::Conv;
 
     fn tcol(id: i32, name: &str, ty: &str, len: i16, p: u8, s: u8, coll: Option<&str>, nullable: bool) -> TargetColumn {
@@ -1295,8 +1296,8 @@ mod tests {
     }
 
     fn duck_con(ddl: &str) -> Connection {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch(ddl).unwrap();
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, ddl).unwrap();
         con
     }
 

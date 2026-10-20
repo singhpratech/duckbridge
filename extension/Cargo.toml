@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 duckdb = { version = "1.10506", default-features = false, features = ["loadable-extension", "vscalar", "chrono", "uuid", "serde_json"] }
-duckbridge = { path = "..", default-features = false }
+duckbridge = { path = "..", default-features = false, features = ["duckdb-v1"] }
 anyhow = "1"
 
 [profile.release]

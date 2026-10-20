@@ -16,6 +16,7 @@
 //! (including the scale reduction when the precision exceeds 38); the translator uses them to choose
 //! `p` and `s` for `mssql_div`. [`verify_cases`] produces random expression pairs to check the macros
 //! against a live SQL Server (`verify-math`).
+use crate::core::duck::{self, Connection};
 use anyhow::Result;
 
 /// `CREATE OR REPLACE MACRO` statements (no trailing `;`) for the session.
@@ -68,8 +69,8 @@ pub fn macros() -> Vec<String> {
 pub const MACRO_NAMES: &[&str] = &["mssql_div", "mssql_round", "mssql_round_trunc", "mssql_try_int", "mssql_format_pct"];
 
 /// Install the macros on a connection.
-pub fn install(con: &duckdb::Connection) -> Result<()> {
-    for m in macros() { con.execute_batch(&m)?; }
+pub fn install(con: &Connection) -> Result<()> {
+    for m in macros() { duck::exec(con, &m)?; }
     Ok(())
 }
 
@@ -216,11 +217,11 @@ pub fn verify_cases(n: usize, seed: u64) -> Vec<MathCase> {
 pub fn tsql_query(c: &MathCase) -> String { format!("SELECT {}", c.expr_tsql) }
 
 /// Evaluate every case on DuckDB (installs the macros first). Errors are returned as `ERROR: ...` text.
-pub fn duck_eval(con: &duckdb::Connection, cases: &[MathCase]) -> Result<Vec<String>> {
+pub fn duck_eval(con: &Connection, cases: &[MathCase]) -> Result<Vec<String>> {
     install(con)?;
     let mut out = Vec::with_capacity(cases.len());
     for c in cases {
-        let v = con.query_row(&format!("SELECT {}", c.expr_duck), [], |r| r.get::<_, String>(0));
+        let v = duck::query_scalar::<String>(con, &format!("SELECT {}", c.expr_duck));
         out.push(match v { Ok(s) => s, Err(e) => format!("ERROR: {}", e.to_string().lines().next().unwrap_or("")) });
     }
     Ok(out)
@@ -247,13 +248,13 @@ pub fn compare(cases: &[MathCase], duck: &[String], mssql: &[String]) -> Vec<Mis
 mod tests {
     use super::*;
 
-    fn con() -> duckdb::Connection {
-        let c = duckdb::Connection::open_in_memory().unwrap();
+    fn con() -> Connection {
+        let c = duck::open_in_memory().unwrap();
         install(&c).unwrap();
         c
     }
-    fn q(c: &duckdb::Connection, e: &str) -> String {
-        c.query_row(&format!("SELECT COALESCE(CAST({e} AS VARCHAR), 'NULL')"), [], |r| r.get::<_, String>(0)).unwrap()
+    fn q(c: &Connection, e: &str) -> String {
+        duck::query_scalar::<String>(c, &format!("SELECT COALESCE(CAST({e} AS VARCHAR), 'NULL')")).unwrap()
     }
 
     // Every expected value below was produced by SQL Server 2019 (container on :14319) with
@@ -306,9 +307,9 @@ mod tests {
         for (e, want) in cases { assert_eq!(q(&c, e), want, "{e}"); }
         // a 28-digit dividend needs several HUGEINT chunks
         assert_eq!(q(&c, "mssql_div(CAST('1234567890123456789012345678.1234567890' AS DECIMAL(38,10)), CAST('9876543210987654321.12345' AS DECIMAL(38,10)), 38, 6)"), "124999998.860937");
-        let err = c.query_row("SELECT mssql_div(1, 0, 10, 6)", [], |r| r.get::<_, String>(0)).unwrap_err().to_string();
+        let err = duck::query_scalar::<String>(&c, "SELECT mssql_div(1, 0, 10, 6)").unwrap_err().to_string();
         assert!(err.contains("Divide by zero"), "{err}");
-        let err = c.query_row("SELECT mssql_div(1.5::DOUBLE, 2, 10, 6)", [], |r| r.get::<_, String>(0)).unwrap_err().to_string();
+        let err = duck::query_scalar::<String>(&c, "SELECT mssql_div(1.5::DOUBLE, 2, 10, 6)").unwrap_err().to_string();
         assert!(err.contains("DECIMAL or integer"), "{err}");
     }
 
@@ -375,7 +376,7 @@ mod tests {
         assert_ne!(a, verify_cases(50, 8));
         assert_eq!(a.len(), 50);
         for k in MACRO_NAMES { assert!(a.iter().any(|c| c.kind == *k), "{k}"); }
-        let c = duckdb::Connection::open_in_memory().unwrap();
+        let c = duck::open_in_memory().unwrap();
         let out = duck_eval(&c, &a).unwrap();
         for (o, cs) in out.iter().zip(&a) { assert!(!o.starts_with("ERROR"), "{} -> {o}", cs.expr_duck); }
     }
@@ -388,7 +389,7 @@ mod tests {
         let Ok(cmd) = std::env::var("DUCKBRIDGE_SQLCMD") else { return };
         let n: usize = std::env::var("DUCKBRIDGE_MATH_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
         let cases = verify_cases(n, 42);
-        let duck = duck_eval(&duckdb::Connection::open_in_memory().unwrap(), &cases).unwrap();
+        let duck = duck_eval(&duck::open_in_memory().unwrap(), &cases).unwrap();
         let mut script = String::from("SET NOCOUNT ON;\n");
         for c in &cases { script.push_str(&tsql_query(c)); script.push_str(";\n"); }
         let dir = std::env::temp_dir().join(format!("duckbridge-verify-math-{}", std::process::id()));

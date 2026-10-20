@@ -2,6 +2,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use duckbridge::core::catalog::{open_readonly, read_catalog, CatalogOptions};
+use duckbridge::core::duck;
 use duckbridge::core::emit::{Emitter, Flavor};
 use duckbridge::core::script::{write_script, ScriptOptions};
 use duckbridge::core::typemap::{StringMode, Target};
@@ -550,7 +551,7 @@ fn audit_ci_cmd(a: AuditCiArgs, q: bool) -> Result<()> {
 fn verify_math_cmd(a: VerifyMathArgs) -> Result<()> {
     use duckbridge::mathcompat::*;
     let cases = verify_cases(a.cases, a.seed);
-    let duck = duckdb::Connection::open_in_memory()?;
+    let duck = duck::open_in_memory()?;
     let d = duck_eval(&duck, &cases)?;
     let rt = mssql::runtime()?;
     let target = a.conn.target("master");
@@ -661,13 +662,13 @@ fn run(a: RunArgs, q: bool) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     print_warnings(&tr.warnings);
-    let con = duckdb::Connection::open(&a.duckdb)?;
+    let con = duck::open(&a.duckdb)?;
     if from == Dialect::Tsql {
-        for p in transpile::duckdb_prelude_for(mode) { con.execute_batch(p)?; }
+        for p in transpile::duckdb_prelude_for(mode) { duck::exec(&con, p)?; }
         if a.mssql_math { duckbridge::mathcompat::install(&con)?; }
     }
-    if let Some(m) = &a.memory_limit { con.execute_batch(&format!("SET memory_limit='{m}'"))?; }
-    if let Some(t) = a.threads { con.execute_batch(&format!("SET threads={t}"))?; }
+    if let Some(m) = &a.memory_limit { duck::set_setting(&con, "memory_limit", &format!("'{m}'"))?; }
+    if let Some(t) = a.threads { duck::set_setting(&con, "threads", &t.to_string())?; }
     let mut ok = 0;
     let mut failed = 0;
     for stmt in duckbridge::transpile::tokens::statements(&duckbridge::transpile::tokens::tokenize(&tr.sql, false)) {
@@ -676,8 +677,8 @@ fn run(a: RunArgs, q: bool) -> Result<()> {
         let t0 = std::time::Instant::now();
         let is_query = s.to_uppercase().starts_with("SELECT") || s.to_uppercase().starts_with("WITH") || s.to_uppercase().starts_with("FROM");
         let res: Result<()> = if is_query {
-            (|| { let mut st = con.prepare(&s)?; let mut rows = st.query([])?; let mut n = 0; let mut shown = 0; while let Some(r) = rows.next()? { n += 1; if shown < 20 { let w = r.as_ref().column_count(); let vals: Vec<String> = (0..w).map(|i| format!("{:?}", r.get_ref_unwrap(i))).collect(); println!("{}", vals.join(" | ")); shown += 1; } } if n > shown { println!("... {n} rows"); } Ok(()) })()
-        } else { con.execute_batch(&s).map_err(|e| e.into()) };
+            (|| { let mut n = 0; let mut shown = 0; duck::for_each_row(&con, &s, |r| { n += 1; if shown < 20 { let w = r.as_ref().column_count(); let vals: Vec<String> = (0..w).map(|i| format!("{:?}", r.get_ref_unwrap(i))).collect(); println!("{}", vals.join(" | ")); shown += 1; } Ok(()) })?; if n > shown { println!("... {n} rows"); } Ok(()) })()
+        } else { duck::exec(&con, &s) };
         match res {
             Ok(_) => { ok += 1; log(q, format!("ok   ({:.2}s) {}", t0.elapsed().as_secs_f64(), s.lines().next().unwrap_or("").chars().take(100).collect::<String>())); }
             Err(e) => { failed += 1; eprintln!("FAIL {}\n     {e}", s.chars().take(300).collect::<String>()); if !a.continue_on_error { bail!("stopped after {ok} statement(s); use --continue-on-error to keep going"); } }
@@ -710,9 +711,9 @@ fn import_inner(a: ImportArgs, q: bool) -> Result<()> {
     })?;
     let total_rows: i64 = tables.iter().map(|t| t.row_count).sum();
     log(q, format!("{} tables, {} views, ~{} rows", tables.len(), views.len(), total_rows));
-    let con = duckdb::Connection::open(&a.out)?;
-    if let Some(m) = &a.memory_limit { con.execute_batch(&format!("SET memory_limit='{m}'"))?; }
-    con.execute_batch("SET preserve_insertion_order=false")?;
+    let con = duck::open(&a.out)?;
+    if let Some(m) = &a.memory_limit { duck::set_setting(&con, "memory_limit", &format!("'{m}'"))?; }
+    duck::set_setting(&con, "preserve_insertion_order", "false")?;
     create_duck_schema(&con, &tables, &views, &opts, &mut warnings)?;
     log(q, "schema created in DuckDB");
     if !a.schema_only {
@@ -726,7 +727,7 @@ fn import_inner(a: ImportArgs, q: bool) -> Result<()> {
         add_keys(&con, &tables, &opts, &mut warnings)?;
     }
     create_duck_views(&con, &views, &opts, &mut warnings);
-    con.execute_batch("CHECKPOINT")?;
+    duck::exec(&con, "CHECKPOINT")?;
     drop(con);
     let size = std::fs::metadata(&a.out).map(|m| m.len()).unwrap_or(0);
     println!("wrote {} ({:.1} MB)", a.out.display(), size as f64 / 1e6);
@@ -745,7 +746,7 @@ fn export_inner(a: ExportArgs, q: bool) -> Result<()> {
     let path = localize(&a.duckdb, q)?;
     duckbridge::core::typemap::set_mssql_version(a.target_version);
     let con = open_readonly(&path.to_string_lossy())?;
-    if let Some(m) = &a.memory_limit { con.execute_batch(&format!("SET memory_limit='{m}'"))?; }
+    if let Some(m) = &a.memory_limit { duck::set_setting(&con, "memory_limit", &format!("'{m}'"))?; }
     let target_kind = if matches!(a.to, ExportKind::Postgres | ExportKind::Parquet) { Target::Postgres } else { Target::Mssql };
     let opts = CatalogOptions { include: a.tables.clone(), exclude: a.exclude.clone(), string_mode: match a.string_mode { StringModeArg::Fit => StringMode::Fit, StringModeArg::Max => StringMode::Max }, target: target_kind, measure: true, string_type: duckbridge::core::typemap::StringType::parse(&a.string_type)?, string_sizes: string_sizes_arg(&a.string_sizes)? };
     let mut cat = read_catalog(&con, &a.duckdb, &opts)?;

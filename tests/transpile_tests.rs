@@ -1,4 +1,5 @@
 //! Translator unit tests: T-SQL <-> DuckDB <-> PostgreSQL.
+use duckbridge::core::duck;
 use duckbridge::transpile::{codes, translate, translate_expr, translate_with, Dialect, NocaseMode, Options, TranslateError, Warning};
 use std::collections::HashMap;
 
@@ -244,9 +245,9 @@ fn has(w: &[Warning], code: &str) -> bool { w.iter().any(|x| x.code == code) }
 }
 #[test] fn nocase_rewrite_executes_like_sql_server() {
     let (s, _) = t2d_with("SELECT count(*) FROM t WHERE name = 'ALICE' OR name IN ('bob')", &opts());
-    let con = duckdb::Connection::open_in_memory().unwrap();
-    con.execute_batch("CREATE TABLE t (name VARCHAR); INSERT INTO t VALUES ('Alice'), ('alice  '), ('Bob'), ('carol')").unwrap();
-    let n: i64 = con.query_row(s.trim_end_matches(';'), [], |r| r.get(0)).unwrap();
+    let con = duck::open_in_memory().unwrap();
+    duck::exec(&con, "CREATE TABLE t (name VARCHAR); INSERT INTO t VALUES ('Alice'), ('alice  '), ('Bob'), ('carol')").unwrap();
+    let n: i64 = duck::query_scalar(&con, s.trim_end_matches(';')).unwrap();
     assert_eq!(n, 3); // SQL Server (CI_AS): 'Alice', 'alice  ' and 'Bob'
 }
 #[test] fn w_ci_compare_not_rewritten() {
@@ -317,13 +318,13 @@ fn has(w: &[Warning], code: &str) -> bool { w.iter().any(|x| x.code == code) }
     assert!(r.sql.contains("CAST(mssql_div(CAST(qty * 1.0 AS DECIMAL(13,1)), CAST(cnt AS DECIMAL(10,0)), 24, 12) AS DECIMAL(24,12))"), "{}", r.sql);
     assert!(r.sql.contains("CAST(mssql_div(CAST(7 * 1.0 AS DECIMAL(4,1)), CAST(3 AS DECIMAL(1,0)), 9, 6) AS DECIMAL(9,6))"), "{}", r.sql);
     assert!(r.sql.contains("mssql_round_trunc(price, 2)") && r.sql.contains("mssql_round(price, 2)") && r.sql.contains("mssql_try_int(s)") && r.sql.contains("mssql_format_pct("), "{}", r.sql);
-    let con = duckdb::Connection::open_in_memory().unwrap();
+    let con = duck::open_in_memory().unwrap();
     let stmts: Vec<String> = duckbridge::transpile::tokens::statements(&duckbridge::transpile::tokens::tokenize(&r.sql, false))
         .iter().map(|s| duckbridge::transpile::tokens::join(s).trim().to_string()).filter(|s| !s.is_empty()).collect();
     let (last, init) = stmts.split_last().unwrap();
-    for s in init { con.execute_batch(s).unwrap(); }
-    let mut st = con.prepare(&format!("SELECT CAST(r AS VARCHAR), CAST(tr AS VARCHAR), CAST(rd AS VARCHAR), COALESCE(CAST(ti AS VARCHAR), 'NULL'), pct, CAST(lit AS VARCHAR) FROM ({last}) ORDER BY r DESC")).unwrap();
-    let rows: Vec<Vec<String>> = st.query_map([], |row| (0..6).map(|i| row.get::<_, String>(i)).collect()).unwrap().map(|x| x.unwrap()).collect();
+    for s in init { duck::exec(&con, s).unwrap(); }
+    let rows: Vec<Vec<String>> = duck::query_rows(&con, &format!("SELECT CAST(r AS VARCHAR), CAST(tr AS VARCHAR), CAST(rd AS VARCHAR), COALESCE(CAST(ti AS VARCHAR), 'NULL'), pct, CAST(lit AS VARCHAR) FROM ({last}) ORDER BY r DESC"),
+        |row| Ok((0..6).map(|i| row.get::<_, String>(i)).collect::<Result<Vec<_>, _>>()?)).unwrap();
     // SQL Server 2019: CAST(10 AS int)*1.0/CAST(4 AS int) = 2.500000000000; ROUND(2.567,2,1) = 2.560; ROUND(2.567,2) = 2.570;
     // TRY_CAST('' AS int) = 0; FORMAT(0.025, '0.0%') = 2.5%; 7*1.0/3 = 2.333333; 7*1.0/3 (int columns) = 2.333333333333;
     // ROUND(-2.567,2,1) = -2.560; ROUND(-2.567,2) = -2.570; TRY_CAST('12.5' AS int) = NULL; FORMAT(0.023333333333333, '0.0%') = 2.3%

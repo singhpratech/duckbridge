@@ -22,7 +22,7 @@ use crate::core::runlog::{self, Failure, SummaryEntry};
 use crate::core::typemap::quote_duck;
 use crate::verify::{self, VerifyLevel, VerifyResult};
 use anyhow::{anyhow, bail, Context, Result};
-use duckdb::Connection;
+use crate::core::duck::{self, Connection};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -65,10 +65,9 @@ pub struct ExistingLoadReport {
 /// Describe a Parquet source as a catalog table (schema from DuckDB, row count from the files).
 pub fn parquet_table(con: &Connection, schema: &str, name: &str, glob: &str) -> Result<Table> {
     let src = format!("read_parquet('{}', hive_partitioning = true)", glob.replace('\'', "''"));
-    let mut st = con.prepare(&format!("DESCRIBE SELECT * FROM {src}"))?;
-    let cols: Vec<(String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let cols: Vec<(String, String)> = duck::query_rows(con, &format!("DESCRIBE SELECT * FROM {src}"), |r| Ok((r.get(0)?, r.get(1)?)))?;
     if cols.is_empty() { bail!("--source-parquet {glob}: no columns found"); }
-    let row_count: i64 = con.query_row(&format!("SELECT count(*) FROM {src}"), [], |r| r.get(0))?;
+    let row_count: i64 = duck::query_scalar(con, &format!("SELECT count(*) FROM {src}"))?;
     let columns = cols.into_iter().map(|(n, t)| Column { select_expr: quote_duck(&n), name: n, duck_type: t, nullable: true, default: None, comment: None, sql_type: String::new(), conv: Conv::Identity, max_len: None, identity: None, enum_values: None, warnings: vec![] }).collect();
     Ok(Table { schema: schema.into(), name: name.into(), columns, constraints: vec![], indexes: vec![], row_count, comment: None })
 }
@@ -327,10 +326,10 @@ mod tests {
 
     #[test]
     fn parquet_source_describes_columns() {
-        let con = Connection::open_in_memory().unwrap();
+        let con = duck::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.parquet");
-        con.execute_batch(&format!("COPY (SELECT 1 AS id, 'x' AS s, DATE '2024-01-01' AS d) TO '{}' (FORMAT PARQUET)", p.display())).unwrap();
+        duck::exec(&con, &format!("COPY (SELECT 1 AS id, 'x' AS s, DATE '2024-01-01' AS d) TO '{}' (FORMAT PARQUET)", p.display())).unwrap();
         let t = parquet_table(&con, "main", "t", &p.display().to_string()).unwrap();
         assert_eq!(t.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id", "s", "d"]);
         assert_eq!(t.row_count, 1);

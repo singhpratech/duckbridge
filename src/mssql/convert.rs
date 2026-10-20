@@ -13,7 +13,7 @@
 //! page and fails on unmappable characters, so nothing reaches the server as `?` either way.
 use super::target::TargetColumn;
 use anyhow::{bail, Result};
-use duckdb::types::{TimeUnit, ValueRef};
+use crate::core::duck::{Decimal, TimeUnit, ValueRef};
 use std::borrow::Cow;
 use std::fmt;
 use tiberius::numeric::Numeric;
@@ -279,12 +279,12 @@ impl Converter {
     }
 
     /// Fast path for DECIMAL / HUGEINT Arrow columns: mantissa and scale straight from the array,
-    /// without building a `duckdb::types::Decimal` (which re-validates the digit count).
+    /// without building a `duck::Decimal` (which re-validates the digit count).
     #[inline]
     pub(crate) fn convert_mantissa(&self, m: i128, s: u8) -> Result<ColumnData<'static>> {
         match self {
             Converter::Decimal { precision, scale } => Ok(ColumnData::Numeric(Some(Numeric::new_with_scale(rescale(m, s, *scale, *precision)?, *scale)))),
-            _ => match duckdb::types::Decimal::new(38, s, m) {
+            _ => match Decimal::new(38, s, m) {
                 Ok(d) => self.convert(ValueRef::Decimal(d)),
                 Err(e) => bail!("invalid decimal mantissa {m} scale {s}: {e:?}"),
             },
@@ -515,7 +515,7 @@ fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
 }
 
 fn fmt_mantissa(m: i128, s: u8) -> String {
-    match duckdb::types::Decimal::new(38, s, m) {
+    match Decimal::new(38, s, m) {
         Ok(d) => d.to_string(),
         Err(_) => format!("{m}e-{s}"),
     }
@@ -779,7 +779,7 @@ fn parse_ts_offset(s: &str) -> Result<(chrono::NaiveDateTime, i16)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use duckdb::types::Decimal as DDec;
+    use crate::core::duck::{self, Connection, Decimal as DDec};
 
     fn dec(width: u8, scale: u8, v: i128) -> ValueRef<'static> {
         ValueRef::Decimal(DDec::new(width, scale, v).unwrap())
@@ -1111,8 +1111,8 @@ pub(crate) mod tests {
     }
 
     /// The spec's row shape (R5.6): 6 varchar, 2 char(3), 5 int, 1 decimal(8,5), 1 date, 2 datetime2.
-    pub(crate) fn bench_table(con: &duckdb::Connection, rows: i64) -> Vec<Converter> {
-        con.execute_batch(&format!(
+    pub(crate) fn bench_table(con: &Connection, rows: i64) -> Vec<Converter> {
+        duck::exec(con, &format!(
             "CREATE TABLE b AS SELECT
                 'CUST' || lpad((i % 100000)::VARCHAR, 7, '0') AS v1, 'product-' || (i % 5000) AS v2, 'region_' || (i % 50) AS v3,
                 'order line description ' || i AS v4, md5(i::VARCHAR) AS v5, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note' END AS v6,
@@ -1136,15 +1136,14 @@ pub(crate) mod tests {
     #[ignore]
     fn bench_convert() {
         let rows: i64 = std::env::var("DUCKBRIDGE_BENCH_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
-        let con = duckdb::Connection::open_in_memory().unwrap();
+        let con = duck::open_in_memory().unwrap();
         let convs = bench_table(&con, rows);
         {
             // baseline: the DuckDB streaming read alone
             let t0 = std::time::Instant::now();
-            let mut stmt = con.prepare("SELECT * FROM b").unwrap();
-            drop(stmt.stream_arrow([]).unwrap());
+            let mut stream = duck::stream(&con, "SELECT * FROM b").unwrap();
             let mut n = 0usize;
-            while let Some(c) = stmt.step().unwrap() { n += duckdb::arrow::array::Array::len(&c); }
+            while let Some(c) = stream.next_chunk().unwrap() { n += duck::arrow::array::Array::len(&c); }
             let secs = t0.elapsed().as_secs_f64();
             println!("bench_convert (DuckDB read only): {n} rows in {secs:.3} s = {:.0} rows/s", n as f64 / secs);
         }

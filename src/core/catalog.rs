@@ -2,7 +2,7 @@
 use super::model::*;
 use super::typemap::{map_column_with, parse_type, quote_duck, StringMode, StringType, Target};
 use anyhow::{Context, Result};
-use duckdb::Connection;
+use super::duck::{self, list_of_strings, Connection};
 use std::collections::HashMap;
 
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "system", "temp"];
@@ -57,9 +57,8 @@ impl Default for CatalogOptions {
 }
 
 pub fn open_readonly(path: &str) -> Result<Connection> {
-    let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-    let con = Connection::open_with_flags(path, cfg).with_context(|| format!("opening DuckDB file {path}"))?;
-    con.execute_batch("SET TimeZone='UTC';")?;
+    let con = duck::open_readonly(path).with_context(|| format!("opening DuckDB file {path}"))?;
+    duck::exec(&con, "SET TimeZone='UTC';")?;
     Ok(con)
 }
 
@@ -73,17 +72,16 @@ fn wanted(o: &CatalogOptions, schema: &str, name: &str) -> bool {
 }
 
 pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Result<Catalog> {
-    let version: String = con.query_row("select version()", [], |r| r.get(0))?;
-    let db: String = con.query_row("select current_database()", [], |r| r.get(0))?;
+    let version: String = duck::query_scalar(con, "select version()")?;
+    let db: String = duck::query_scalar(con, "select current_database()")?;
 
     // enum user types -> expanded ENUM('a','b') strings
     let mut enums: HashMap<String, String> = HashMap::new();
     {
-        let mut st = con.prepare("select schema_name, type_name from duckdb_types() where logical_type='ENUM' and not internal and database_name=?")?;
-        let rows: Vec<(String, String)> = st.query_map([&db], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        let rows: Vec<(String, String)> = duck::query_rows_with(con, "select schema_name, type_name from duckdb_types() where logical_type='ENUM' and not internal and database_name=?", &[&db], |r| Ok((r.get(0)?, r.get(1)?)))?;
         for (sch, tn) in rows {
             let sql = format!("select list_aggregate(list_transform(enum_range(NULL::{}.{}), x -> '''' || replace(x, '''', '''''') || ''''), 'string_agg', ', ')", quote_duck(&sch), quote_duck(&tn));
-            let vals: String = con.query_row(&sql, [], |r| r.get(0))?;
+            let vals: String = duck::query_scalar(con, &sql)?;
             let e = format!("ENUM({vals})");
             enums.insert(tn.clone(), e.clone());
             enums.insert(format!("{sch}.{tn}"), e);
@@ -91,15 +89,9 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
     }
 
     // sequences
-    let mut sequences = Vec::new();
-    {
-        let mut st = con.prepare("select schema_name, sequence_name, start_value, increment_by, last_value from duckdb_sequences() where database_name=? order by 1,2")?;
-        for r in st.query_map([&db], |r| {
-            Ok(Sequence { schema: r.get(0)?, name: r.get(1)?, start: r.get(2)?, increment: r.get(3)?, last_value: r.get(4)? })
-        })? {
-            sequences.push(r?);
-        }
-    }
+    let sequences: Vec<Sequence> = duck::query_rows_with(con, "select schema_name, sequence_name, start_value, increment_by, last_value from duckdb_sequences() where database_name=? order by 1,2", &[&db], |r| {
+        Ok(Sequence { schema: r.get(0)?, name: r.get(1)?, start: r.get(2)?, increment: r.get(3)?, last_value: r.get(4)? })
+    })?;
     let seq_lookup = |key: &str| -> Option<&Sequence> {
         let key = key.replace('"', "");
         sequences.iter().find(|s| format!("{}.{}", s.schema, s.name) == key || s.name == key || key.ends_with(&format!(".{}", s.name)))
@@ -108,18 +100,15 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
     // tables
     let mut tables = Vec::new();
     {
-        let mut st = con.prepare("select schema_name, table_name, comment from duckdb_tables() where database_name=? and not internal order by 1,2")?;
-        let trows: Vec<(String, String, Option<String>)> = st.query_map([&db], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        let trows: Vec<(String, String, Option<String>)> = duck::query_rows_with(con, "select schema_name, table_name, comment from duckdb_tables() where database_name=? and not internal order by 1,2", &[&db], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         for (sch, tname, tcomment) in trows {
             if SYSTEM_SCHEMAS.contains(&sch.as_str()) || !wanted(o, &sch, &tname) {
                 continue;
             }
             let mut cols = Vec::new();
-            let mut cst = con.prepare("select column_name, data_type, is_nullable, column_default, comment from duckdb_columns() where database_name=? and schema_name=? and table_name=? order by column_index")?;
-            for r in cst.query_map([&db, &sch, &tname], |r| {
+            for (name, mut dtype, nullable, default, comment) in duck::query_rows_with(con, "select column_name, data_type, is_nullable, column_default, comment from duckdb_columns() where database_name=? and schema_name=? and table_name=? order by column_index", &[&db, &sch, &tname], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, Option<String>>(4)?))
             })? {
-                let (name, mut dtype, nullable, default, comment) = r?;
                 if let Some(e) = enums.get(&dtype) {
                     dtype = e.clone();
                 }
@@ -131,11 +120,9 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
                 });
             }
             let mut constraints = Vec::new();
-            let mut kst = con.prepare("select constraint_type, constraint_column_names, expression, constraint_name, referenced_table, referenced_column_names from duckdb_constraints() where database_name=? and schema_name=? and table_name=? order by constraint_index")?;
-            for r in kst.query_map([&db, &sch, &tname], |r| {
+            for (ctype, ccols, expr, cname, rtable, rcols) in duck::query_rows_with(con, "select constraint_type, constraint_column_names, expression, constraint_name, referenced_table, referenced_column_names from duckdb_constraints() where database_name=? and schema_name=? and table_name=? order by constraint_index", &[&db, &sch, &tname], |r| {
                 Ok((r.get::<_, String>(0)?, list_of_strings(r, 1), r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, Option<String>>(4)?, list_of_strings(r, 5)))
             })? {
-                let (ctype, ccols, expr, cname, rtable, rcols) = r?;
                 let kind = match ctype.as_str() {
                     "PRIMARY KEY" => ConstraintKind::PrimaryKey,
                     "UNIQUE" => ConstraintKind::Unique,
@@ -150,9 +137,7 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
                 });
             }
             let mut indexes = Vec::new();
-            let mut ist = con.prepare("select index_name, is_unique, expressions, sql from duckdb_indexes() where database_name=? and schema_name=? and table_name=?")?;
-            for r in ist.query_map([&db, &sch, &tname], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, list_of_strings(r, 2), r.get::<_, Option<String>>(3)?)))? {
-                let (iname, uniq, exprs, isql) = r?;
+            for (iname, uniq, exprs, isql) in duck::query_rows_with(con, "select index_name, is_unique, expressions, sql from duckdb_indexes() where database_name=? and schema_name=? and table_name=?", &[&db, &sch, &tname], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?, list_of_strings(r, 2), r.get::<_, Option<String>>(3)?)))? {
                 if let Some(cols) = index_columns(&exprs, isql.as_deref()) {
                     indexes.push(Index { name: iname, columns: cols, unique: uniq });
                 }
@@ -167,7 +152,7 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
     for t in &mut tables {
         let mut ascii: HashMap<usize, bool> = HashMap::new();
         let fq = format!("{}.{}", quote_duck(&t.schema), quote_duck(&t.name));
-        t.row_count = con.query_row(&format!("select count(*) from {fq}"), [], |r| r.get(0))?;
+        t.row_count = duck::query_scalar(con, &format!("select count(*) from {fq}"))?;
         if o.measure && t.row_count > 0 {
             let keys = t.key_columns();
             let idx: Vec<usize> = t.columns.iter().enumerate()
@@ -202,7 +187,7 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
                 }
                 let sql = format!("select {} from {fq}", sel.join(", "));
                 let n_len = idx.len();
-                let (vals, flags): (Vec<Option<i64>>, Vec<Option<bool>>) = con.query_row(&sql, [], |r| {
+                let (vals, flags): (Vec<Option<i64>>, Vec<Option<bool>>) = duck::query_one(con, &sql, |r| {
                     let v = (0..n_len).map(|i| r.get(i)).collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
                     let f = (n_len..sel.len()).map(|i| r.get(i)).collect::<std::result::Result<Vec<Option<bool>>, _>>()?;
                     Ok((v, f))
@@ -233,9 +218,7 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
     // views
     let mut views = Vec::new();
     {
-        let mut st = con.prepare("select schema_name, view_name, sql, comment from duckdb_views() where database_name=? and not internal order by 1,2")?;
-        for r in st.query_map([&db], |r| Ok(View { schema: r.get(0)?, name: r.get(1)?, sql: r.get(2)?, comment: r.get(3)? }))? {
-            let v = r?;
+        for v in duck::query_rows_with(con, "select schema_name, view_name, sql, comment from duckdb_views() where database_name=? and not internal order by 1,2", &[&db], |r| Ok(View { schema: r.get(0)?, name: r.get(1)?, sql: r.get(2)?, comment: r.get(3)? }))? {
             if !SYSTEM_SCHEMAS.contains(&v.schema.as_str()) && wanted(o, &v.schema, &v.name) {
                 views.push(v);
             }
@@ -247,21 +230,6 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
     Ok(Catalog { source: source.into(), duckdb_version: version, schemas, tables, views, sequences, warnings: vec![] })
 }
 
-fn list_of_strings(r: &duckdb::Row, i: usize) -> Vec<String> {
-    // DuckDB LIST(VARCHAR) comes back as a ListType value; simplest robust path is via its text form.
-    match r.get_ref(i) {
-        Ok(duckdb::types::ValueRef::List(list, idx)) => {
-            use duckdb::arrow::array::Array;
-            let arr: std::sync::Arc<dyn Array> = match list { duckdb::types::ListType::Regular(a) => a.value(idx), duckdb::types::ListType::Large(a) => a.value(idx) };
-            let sa = arr.as_any().downcast_ref::<duckdb::arrow::array::StringArray>();
-            match sa {
-                Some(sa) => (0..sa.len()).filter(|k| !sa.is_null(*k)).map(|k| sa.value(k).to_string()).collect(),
-                None => vec![],
-            }
-        }
-        _ => vec![],
-    }
-}
 
 fn nextval_target(default: &str) -> Option<String> {
     let low = default.to_lowercase();
@@ -297,8 +265,8 @@ mod tests {
 
     #[test]
     fn auto_string_type_measures_ascii() {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch("create table t(a varchar, b varchar); insert into t values ('abc','h\u{00e9}llo'),(NULL,'x');").unwrap();
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, "create table t(a varchar, b varchar); insert into t values ('abc','h\u{00e9}llo'),(NULL,'x');").unwrap();
         let o = CatalogOptions { string_type: StringType::Auto, ..Default::default() };
         let cat = read_catalog(&con, "mem", &o).unwrap();
         let t = &cat.tables[0];
@@ -314,8 +282,8 @@ mod tests {
 
     #[test]
     fn pinned_and_max_sizes() {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch("create table t(a varchar, b varchar); insert into t values ('abc','x');").unwrap();
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, "create table t(a varchar, b varchar); insert into t values ('abc','x');").unwrap();
         let mut m = HashMap::new();
         m.insert("t.a".to_string(), "varchar(12)".to_string());
         let o = CatalogOptions { string_sizes: StringSizes::File(m), ..Default::default() };

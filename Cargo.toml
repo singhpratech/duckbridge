@@ -21,12 +21,16 @@ required-features = ["bundled"]
 
 [features]
 # The CLI bundles DuckDB. The DuckDB extension (extension/) depends on this crate with
-# default-features = false and links against the running DuckDB through the C API instead.
-default = ["bundled"]
-bundled = ["duckdb/bundled"]
+# default-features = false, features = ["duckdb-v1"] and links against the running DuckDB
+# through the C API instead.
+default = ["duckdb-v1", "bundled"]
+bundled = ["duckdb-v1", "duckdb/bundled"]
+# DuckDB backend (exactly one is needed; see src/core/duck.rs and docs/handoff-duck-layer.md):
+# duckdb-v1 = duckdb-rs on the DuckDB 1.x C API. A `duckdb-neo` backend (DuckDB 2.0) goes next to it.
+duckdb-v1 = ["dep:duckdb"]
 
 [dependencies]
-duckdb = { version = "1.10506", default-features = false, features = ["chrono", "uuid", "serde_json"] }
+duckdb = { version = "1.10506", default-features = false, features = ["chrono", "uuid", "serde_json"], optional = true }
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "chrono", "rust_decimal", "tds73"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }

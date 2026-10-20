@@ -17,7 +17,7 @@ use crate::core::typemap::quote_duck;
 use crate::mssql::target::{self, TableMapping, TargetColumn, TargetTable};
 use crate::mssql::{bracket, nstr, MsClient};
 use anyhow::{Context, Result};
-use duckdb::Connection;
+use crate::core::duck::Connection;
 use futures_util::TryStreamExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
@@ -690,6 +690,7 @@ fn compare_indexes(before: &TargetTable, after: &TargetTable, disabled: &BTreeSe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::duck;
     use crate::core::model::Conv;
     use crate::mssql::target::{ColumnMapping, TargetCheck, TargetIndex, TargetIndexColumn, TargetPartitioning};
 
@@ -733,8 +734,8 @@ mod tests {
     ];
 
     fn fixture_duck() -> Connection {
-        let con = Connection::open_in_memory().unwrap();
-        con.execute_batch(r#"
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, r#"
             CREATE TABLE g_t (id INTEGER, d DECIMAL(10,2), vc VARCHAR, nv VARCHAR, dt DATE, ts TIMESTAMP, b BOOLEAN, g UUID, ch VARCHAR,
                               m DECIMAL(19,4), f DOUBLE, dtm TIMESTAMP, ts3 TIMESTAMP, dto TIMESTAMP WITH TIME ZONE, tm TIME, bn BLOB, bf BLOB, sdt TIMESTAMP);
             INSERT INTO g_t VALUES

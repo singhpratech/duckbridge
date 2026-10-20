@@ -12,8 +12,7 @@ use crate::core::runlog::{self, Failure};
 use crate::core::typemap::{mssql_to_duck, quote_duck};
 use crate::transpile::{self, Dialect};
 use anyhow::{Context, Result};
-use duckdb::types::Value;
-use duckdb::Connection;
+use crate::core::duck::{self, Connection, TimeUnit, Value};
 use futures_util::TryStreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -239,7 +238,7 @@ pub fn create_duck_schema(con: &Connection, tables: &[MsTable], views: &[MsView]
     let sm = |s: &str| o.schema_map.get(s).cloned().unwrap_or_else(|| s.to_string());
     let mut schemas: Vec<String> = tables.iter().map(|t| sm(&t.schema)).chain(views.iter().map(|v| sm(&v.schema))).collect();
     schemas.sort(); schemas.dedup();
-    for s in &schemas { if s != "main" { con.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {}", quote_duck(s)))?; } }
+    for s in &schemas { if s != "main" { duck::exec(con, &format!("CREATE SCHEMA IF NOT EXISTS {}", quote_duck(s)))?; } }
     let (order, dropped) = topo_order(tables, warnings);
     for &i in &order {
         let t = &tables[i];
@@ -249,7 +248,7 @@ pub fn create_duck_schema(con: &Connection, tables: &[MsTable], views: &[MsView]
             if !c.nullable { l.push_str(" NOT NULL"); }
             if c.is_identity {
                 let seq = format!("seq_{}_{}", t.name, c.name).chars().map(|ch| if ch.is_alphanumeric() || ch == '_' { ch } else { '_' }).collect::<String>();
-                con.execute_batch(&format!("CREATE SEQUENCE IF NOT EXISTS {}.{} START {} INCREMENT {}", quote_duck(&sm(&t.schema)), quote_duck(&seq), c.seed, c.increment.max(1)))?;
+                duck::exec(con, &format!("CREATE SEQUENCE IF NOT EXISTS {}.{} START {} INCREMENT {}", quote_duck(&sm(&t.schema)), quote_duck(&seq), c.seed, c.increment.max(1)))?;
                 l.push_str(&format!(" DEFAULT nextval('{}.{}')", sm(&t.schema), seq));
             }
             lines.push(l);
@@ -263,7 +262,7 @@ pub fn create_duck_schema(con: &Connection, tables: &[MsTable], views: &[MsView]
             lines.push(format!("FOREIGN KEY ({}) REFERENCES {}.{} ({})", fk.0.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", "), quote_duck(&sm(&fk.1)), quote_duck(&fk.2), fk.3.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", ")));
         }
         let ddl = format!("CREATE TABLE {}.{} (\n  {}\n)", quote_duck(&sm(&t.schema)), quote_duck(&t.name), lines.join(",\n  "));
-        con.execute_batch(&ddl).with_context(|| format!("creating DuckDB table {}.{}:\n{ddl}", t.schema, t.name))?;
+        duck::exec(con, &ddl).with_context(|| format!("creating DuckDB table {}.{}:\n{ddl}", t.schema, t.name))?;
     }
     Ok(order)
 }
@@ -276,11 +275,11 @@ pub fn add_keys(con: &Connection, tables: &[MsTable], o: &ImportOptions, warning
         let tref = format!("{}.{}", quote_duck(&sm(&t.schema)), quote_duck(&t.name));
         if !t.pk.is_empty() {
             let sql = format!("ALTER TABLE {tref} ADD PRIMARY KEY ({})", t.pk.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", "));
-            if let Err(e) = con.execute_batch(&sql) { warnings.push(format!("{}.{}: primary key not added: {}", t.schema, t.name, e.to_string().lines().next().unwrap_or(""))); }
+            if let Err(e) = duck::exec(con, &sql) { warnings.push(format!("{}.{}: primary key not added: {}", t.schema, t.name, e.to_string().lines().next().unwrap_or(""))); }
         }
         for u in &t.uniques {
             let sql = format!("CREATE UNIQUE INDEX {} ON {tref} ({})", quote_duck(&format!("uq_{}_{}", t.name, u.join("_"))), u.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", "));
-            if let Err(e) = con.execute_batch(&sql) { warnings.push(format!("{}.{}: unique index not added: {}", t.schema, t.name, e.to_string().lines().next().unwrap_or(""))); }
+            if let Err(e) = duck::exec(con, &sql) { warnings.push(format!("{}.{}: unique index not added: {}", t.schema, t.name, e.to_string().lines().next().unwrap_or(""))); }
         }
     }
     Ok(())
@@ -297,7 +296,7 @@ pub fn create_duck_views(con: &Connection, views: &[MsView], o: &ImportOptions, 
                     // definition is "CREATE VIEW [s].[v] AS SELECT ..."; re-target name into DuckDB
                     let select = transpile::view_body(&tr.sql, false);
                     let ddl = format!("CREATE OR REPLACE VIEW {}.{} AS {}", quote_duck(&sm(&v.schema)), quote_duck(&v.name), select);
-                    match con.execute_batch(&ddl) {
+                    match duck::exec(con, &ddl) {
                         Ok(_) => { for w in tr.warnings { warnings.push(format!("view {}.{}: {w}", v.schema, v.name)); } }
                         Err(e) => failed.push((v, e.to_string())),
                     }
@@ -571,7 +570,7 @@ async fn finish_table(sh: &Shared, con: &Connection, client: &mut SourceClient, 
     let schema = cfg.sm.get(&t.schema).cloned().unwrap_or_else(|| t.schema.clone());
     let del = format!("DELETE FROM {}.{}", quote_duck(&schema), quote_duck(&t.name));
     let d0 = Instant::now();
-    con.execute_batch(&del).with_context(|| format!("clearing {schema}.{} in DuckDB for a re-read", t.name))?;
+    duck::exec(con, &del).with_context(|| format!("clearing {schema}.{} in DuckDB for a re-read", t.name))?;
     runlog::stmt("duckdb", &name, &del, rows, d0);
     let mut q = lk(&sh.queue);
     let mut st = lk(&sh.tables);
@@ -610,7 +609,7 @@ async fn copy_one(con: &Connection, client: &mut SourceClient, t: &MsTable, rang
     let mut sql = format!("SELECT {} FROM {}.{}{hint}", cols.join(", "), bracket(&t.schema), bracket(&t.name));
     if let Some((k, r)) = range { sql.push_str(&format!(" WHERE {}", r.predicate(&bracket(k)))); }
     let q0 = Instant::now();
-    let mut app = con.appender_to_db(&t.name, &schema)?;
+    let mut app = duck::appender(con, &schema, &t.name)?;
     let mut stream = client.query(sql.as_str(), &[]).await.map_err(|e| lock_hint(e, t, lock_timeout_ms))?;
     let mut n = 0i64;
     let mut buf: Vec<Vec<Value>> = Vec::with_capacity(batch_rows);
@@ -619,7 +618,7 @@ async fn copy_one(con: &Connection, client: &mut SourceClient, t: &MsTable, rang
             let vals: Vec<Value> = row.into_iter().map(column_to_value).collect();
             buf.push(vals);
             if buf.len() >= batch_rows {
-                for r in buf.drain(..) { append_values(&mut app, r)?; }
+                for r in buf.drain(..) { app.append_row(r)?; }
                 app.flush()?;
                 n += batch_rows as i64;
                 progress(&format!("{}.{}", t.schema, t.name), n);
@@ -627,7 +626,7 @@ async fn copy_one(con: &Connection, client: &mut SourceClient, t: &MsTable, rang
         }
     }
     n += buf.len() as i64;
-    for r in buf.drain(..) { append_values(&mut app, r)?; }
+    for r in buf.drain(..) { app.append_row(r)?; }
     app.flush()?;
     progress(&format!("{}.{}", t.schema, t.name), n);
     runlog::stmt("source", &format!("{}.{}", t.schema, t.name), &sql, n, q0);
@@ -650,13 +649,13 @@ fn column_to_value(c: ColumnData<'static>) -> Value {
         C::Binary(b) => b.map(|b| Value::Blob(b.into_owned())).unwrap_or(Value::Null),
         C::Xml(x) => x.map(|x| Value::Text(x.to_string())).unwrap_or(Value::Null),
         C::Date(d) => d.map(|d| { let nd: chrono::NaiveDate = chrono::NaiveDate::from_num_days_from_ce_opt(d.days() as i32 + 1).unwrap_or_default(); Value::Date32((nd - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32) }).unwrap_or(Value::Null),
-        C::Time(t) => t.map(|t| Value::Time64(duckdb::types::TimeUnit::Microsecond, time_micros(&t))).unwrap_or(Value::Null),
-        C::DateTime(dt) => dt.map(|dt| Value::Timestamp(duckdb::types::TimeUnit::Microsecond, (dt.days() as i64 - 25_567) * 86_400_000_000 + (dt.seconds_fragments() as i64) * 1_000_000 / 300)).unwrap_or(Value::Null),
-        C::SmallDateTime(dt) => dt.map(|dt| Value::Timestamp(duckdb::types::TimeUnit::Microsecond, (dt.days() as i64 - 25_567) * 86_400_000_000 + dt.seconds_fragments() as i64 * 60_000_000)).unwrap_or(Value::Null),
-        C::DateTime2(dt) => dt.map(|dt| Value::Timestamp(duckdb::types::TimeUnit::Microsecond, dt2_micros(&dt))).unwrap_or(Value::Null),
+        C::Time(t) => t.map(|t| Value::Time64(TimeUnit::Microsecond, time_micros(&t))).unwrap_or(Value::Null),
+        C::DateTime(dt) => dt.map(|dt| Value::Timestamp(TimeUnit::Microsecond, (dt.days() as i64 - 25_567) * 86_400_000_000 + (dt.seconds_fragments() as i64) * 1_000_000 / 300)).unwrap_or(Value::Null),
+        C::SmallDateTime(dt) => dt.map(|dt| Value::Timestamp(TimeUnit::Microsecond, (dt.days() as i64 - 25_567) * 86_400_000_000 + dt.seconds_fragments() as i64 * 60_000_000)).unwrap_or(Value::Null),
+        C::DateTime2(dt) => dt.map(|dt| Value::Timestamp(TimeUnit::Microsecond, dt2_micros(&dt))).unwrap_or(Value::Null),
         C::DateTimeOffset(dto) => dto.map(|dto| {
             let micros = dt2_micros(&dto.datetime2()) - dto.offset() as i64 * 60_000_000; // stored local; convert to UTC
-            Value::Timestamp(duckdb::types::TimeUnit::Microsecond, micros)
+            Value::Timestamp(TimeUnit::Microsecond, micros)
         }).unwrap_or(Value::Null),
     }
 }
@@ -674,12 +673,6 @@ fn dt2_micros(dt: &tiberius::time::DateTime2) -> i64 {
     epoch_days * 86_400_000_000 + time_micros(&dt.time())
 }
 
-fn append_values(app: &mut duckdb::Appender<'_>, r: Vec<Value>) -> Result<()> {
-    let outs: Vec<duckdb::types::ToSqlOutput<'static>> = r.into_iter().map(duckdb::types::ToSqlOutput::Owned).collect();
-    let refs: Vec<&dyn duckdb::ToSql> = outs.iter().map(|o| o as &dyn duckdb::ToSql).collect();
-    app.append_row(refs.as_slice())?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

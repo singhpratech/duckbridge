@@ -4,7 +4,7 @@
 use crate::core::model::Catalog;
 use crate::core::typemap::quote_duck;
 use anyhow::Result;
-use duckdb::Connection;
+use crate::core::duck::{self, Connection};
 
 pub struct ParquetOptions {
     pub compression: String, // zstd | snappy | gzip | uncompressed
@@ -23,7 +23,7 @@ pub fn export_parquet(con: &Connection, cat: &Catalog, out_dir: &std::path::Path
         let p = path.to_string_lossy().replace('\'', "''");
         let sql = format!("COPY (SELECT * FROM {}.{}) TO '{}' (FORMAT PARQUET, COMPRESSION '{}', ROW_GROUP_SIZE {})",
             quote_duck(&t.schema), quote_duck(&t.name), p, o.compression, o.row_group_size);
-        con.execute_batch(&sql)?;
+        duck::exec(con, &sql)?;
         progress(&format!("{}.{}", t.schema, t.name), t.row_count);
         files.push((format!("{}.{}", t.schema, t.name), path));
     }
