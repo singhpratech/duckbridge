@@ -1,8 +1,16 @@
 //! SQL Server connectivity (pure Rust TDS via tiberius). No ODBC driver needed.
 pub mod backup;
+pub mod bulk;
+pub mod convert;
+pub mod fingerprint;
+pub mod guard;
 pub mod import;
+pub mod jobs;
 pub mod load;
 pub mod split;
+pub mod swap;
+pub mod switch;
+pub mod target;
 
 use anyhow::{Context, Result};
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
@@ -91,9 +99,18 @@ pub fn runtime() -> Result<tokio::runtime::Runtime> {
 
 /// Run all statements of a batch (semicolon/GO separated) one by one, draining results.
 pub async fn exec_batch(client: &mut MsClient, sql: &str) -> Result<()> {
+    exec_batch_as(client, "target", "", sql).await
+}
+
+/// `exec_batch` with a role/job label for the run log. In `--plan` mode statements are recorded
+/// and not sent (metadata reads do not go through here, so they still run).
+pub async fn exec_batch_as(client: &mut MsClient, role: &str, job: &str, sql: &str) -> Result<()> {
     for stmt in split_go(sql) {
         if stmt.trim().is_empty() { continue; }
+        let t0 = std::time::Instant::now();
+        if crate::core::runlog::planning() { crate::core::runlog::stmt(role, job, &stmt, 0, t0); continue; }
         client.simple_query(&stmt).await.with_context(|| format!("executing: {}", stmt.chars().take(200).collect::<String>()))?.into_results().await?;
+        crate::core::runlog::stmt(role, job, &stmt, 0, t0);
     }
     Ok(())
 }

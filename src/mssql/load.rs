@@ -1,5 +1,6 @@
 //! DuckDB -> SQL Server direct load over the TDS bulk-copy protocol, N tables in parallel.
-use super::{bracket, exec_batch, MsClient, MssqlTarget};
+use super::guard::Guard;
+use super::{exec_batch, MsClient, MssqlTarget};
 use crate::core::emit::{Emitter, Flavor};
 use crate::core::model::*;
 use crate::core::script::{date_from_days, naive_ts, select_sql, to_micros, trim_ns};
@@ -19,7 +20,14 @@ pub struct LoadOptions {
     pub parallel: usize,
     pub batch_rows: usize,
     pub method: LoadMethod,
-    pub recovery_simple: bool,
+    /// Safety guard: database-level statements only on disposable databases (spec R1).
+    pub guard: Guard,
+    /// Create the database when it does not exist (its name must be disposable). Never implicit.
+    pub create_database: bool,
+    /// `SIMPLE` / `FULL` / `BULK_LOGGED`, applied only to a disposable database and only when asked.
+    pub recovery: Option<String>,
+    /// Compatibility level, applied only to a disposable database and only when asked.
+    pub compat_level: Option<u16>,
     /// Load into a heap and add the clustered primary key afterwards (fastest for big tables).
     pub pk_after_load: bool,
     /// Tables with at least this many rows are split into key ranges across workers.
@@ -49,17 +57,14 @@ pub struct LoadReport {
 /// Create the database (if needed) and all tables; returns the emitter used.
 pub async fn prepare_schema(client_master: &mut MsClient, target: &MssqlTarget, cat: &mut Catalog, em: &Emitter, o: &LoadOptions) -> Result<MsClient> {
     let db = &o.database;
-    let dbq = bracket(db);
-    let dbn = db.replace('\'', "''");
-    if o.drop_existing {
-        exec_batch(client_master, &format!("IF DB_ID(N'{dbn}') IS NOT NULL BEGIN ALTER DATABASE {dbq} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {dbq}; END")).await?;
-    }
-    exec_batch(client_master, &format!("IF DB_ID(N'{dbn}') IS NULL CREATE DATABASE {dbq}")).await?;
-    exec_batch(client_master, &format!("ALTER DATABASE {dbq} SET COMPATIBILITY_LEVEL = 150")).await?;
-    if o.recovery_simple {
-        exec_batch(client_master, &format!("ALTER DATABASE {dbq} SET RECOVERY SIMPLE")).await?;
-    }
-    let mut c = target.connect(db).await?;
+    if o.drop_existing { o.guard.drop_database(client_master, db).await?; }
+    o.guard.ensure_database(client_master, db, o.create_database).await?;
+    if let Some(l) = o.compat_level { o.guard.set_compat_level(client_master, db, l).await?; }
+    if let Some(r) = &o.recovery { if !r.eq_ignore_ascii_case("none") { o.guard.set_recovery(client_master, db, r).await?; } }
+    let st = Guard::database_state(client_master, db).await?;
+    cat.warnings.extend(Guard::describe(&st, db));
+    // in --plan mode the database may not exist yet; DDL is only recorded, so any connection will do
+    let mut c = if crate::core::runlog::planning() && !st.exists { target.connect("master").await? } else { target.connect(db).await? };
     for s in &cat.schemas {
         if em.schema(s) != "dbo" { exec_batch(&mut c, &em.create_schema(s)).await?; }
     }

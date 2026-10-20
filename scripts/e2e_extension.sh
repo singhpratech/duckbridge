@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -f private/env.sh ] && . private/env.sh   # optional, gitignored: local overrides for the variables below
 HOST=${MSSQL_HOST:-localhost}; PORT=${MSSQL_PORT:-14319}; USER=${MSSQL_USER:-sa}
+export DUCKBRIDGE_DISPOSABLE_DB_PATTERN='^d2m_'   # the guard (spec R1) only touches databases matching this
 export MSSQL_PASSWORD=${MSSQL_PASSWORD:-'D2m!Strong#2019'}
 CONTAINER=${MSSQL_CONTAINER:-d2m-mssql2019}
 SQLCMD=${SQLCMD:-/opt/mssql-tools18/bin/sqlcmd}
@@ -25,7 +26,7 @@ check() { if [ "$2" == "$3" ]; then echo "  PASS $1 ($2)"; pass=$((pass+1)); els
 
 echo "== 0. source database on SQL Server =="
 if [ "$(q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name = 'd2m_extsrc'")" != "1" ]; then
-  target/release/duckbridge export tests/fixtures/sample.duckdb --to server --host "$HOST" --port "$PORT" --user "$USER" --database d2m_extsrc --drop-existing -q
+  target/release/duckbridge export tests/fixtures/sample.duckdb --to server --host "$HOST" --port "$PORT" --user "$USER" --database d2m_extsrc --drop-existing --create-database -q
 fi
 
 echo "== 1. load + transpile =="

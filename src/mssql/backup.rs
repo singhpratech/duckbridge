@@ -1,4 +1,5 @@
 //! BACKUP DATABASE to a .bak on the server, fetch it, and optionally verify by restoring it.
+use super::guard::Guard;
 use super::{bracket, exec_batch, MsClient, MssqlTarget};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -84,7 +85,8 @@ pub fn fetch(server_paths: &[String], how: &Fetch, local_dir: &Path) -> Result<V
 }
 
 /// Restore the backup as `new_db` and return per-table row counts. Proves the .bak is a pure, restorable database.
-pub async fn verify_restore(target: &MssqlTarget, server_paths: &[String], new_db: &str, keep: bool) -> Result<BTreeMap<String, i64>> {
+pub async fn verify_restore(target: &MssqlTarget, server_paths: &[String], new_db: &str, keep: bool, guard: &Guard) -> Result<BTreeMap<String, i64>> {
+    guard.assert_disposable(new_db, "RESTORE DATABASE (verification copy)")?;
     let mut c = target.connect("master").await?;
     let disks: Vec<String> = server_paths.iter().map(|p| format!("DISK = N'{}'", p.replace('\'', "''"))).collect();
     let files = c.simple_query(&format!("RESTORE FILELISTONLY FROM {}", disks.join(", "))).await?.into_first_result().await?;
@@ -99,7 +101,7 @@ pub async fn verify_restore(target: &MssqlTarget, server_paths: &[String], new_d
         let ext = if ftype == "L" { "ldf" } else { "mdf" };
         moves.push(format!("MOVE N'{}' TO N'{data_dir}{sep}{new_db}_{i}.{ext}'", logical.replace('\'', "''")));
     }
-    exec_batch(&mut c, &format!("IF DB_ID(N'{0}') IS NOT NULL BEGIN ALTER DATABASE {1} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {1}; END", new_db.replace('\'', "''"), bracket(new_db))).await?;
+    guard.drop_database(&mut c, new_db).await?;
     exec_batch(&mut c, &format!("RESTORE DATABASE {} FROM {} WITH {}, REPLACE, CHECKSUM", bracket(new_db), disks.join(", "), moves.join(", "))).await.context("RESTORE DATABASE failed")?;
     let mut d = target.connect(new_db).await?;
     let rows = d.simple_query(
@@ -113,8 +115,6 @@ pub async fn verify_restore(target: &MssqlTarget, server_paths: &[String], new_d
         counts.insert(format!("{s}.{t}"), n);
     }
     drop(d);
-    if !keep {
-        exec_batch(&mut c, &format!("ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {0}", bracket(new_db))).await?;
-    }
+    if !keep { guard.drop_database(&mut c, new_db).await?; }
     Ok(counts)
 }

@@ -8,6 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=${BIN:-target/release/duckbridge}
 HOST=${MSSQL_HOST:-localhost}; PORT=${MSSQL_PORT:-14319}; USER=${MSSQL_USER:-sa}
+export DUCKBRIDGE_DISPOSABLE_DB_PATTERN='^d2m_'   # the guard (spec R1) only touches databases matching this
 export MSSQL_PASSWORD=${MSSQL_PASSWORD:-'D2m!Strong#2019'}
 CONTAINER=${MSSQL_CONTAINER:-d2m-mssql2019}
 SQLCMD=${SQLCMD:-/opt/mssql-tools18/bin/sqlcmd}
@@ -44,7 +45,7 @@ check "script identity"  "$(q "SET NOCOUNT ON; SELECT COUNT(*) FROM d2m_script.s
 check "script reseed"    "$(q "SET NOCOUNT ON; SELECT CAST(IDENT_CURRENT('d2m_script.dbo.orders') AS INT)")" "1000"
 
 echo "== 2. live load + .bak + verify restore =="
-$BIN export "$FIX" --to bak --host "$HOST" --port "$PORT" --user "$USER" --database d2m_bak --drop-existing \
+$BIN export "$FIX" --to bak --host "$HOST" --port "$PORT" --user "$USER" --database d2m_bak --drop-existing --create-database \
      --backup-dir /var/opt/mssql/data --fetch "docker:$CONTAINER" --out "$WORK/d2m_bak.bak" --verify-restore -q
 check "bak file exists"  "$([ -s "$WORK/d2m_bak.bak" ] && echo yes)" "yes"
 check "bak orders"       "$(q 'SET NOCOUNT ON; SELECT COUNT(*) FROM d2m_bak.dbo.orders')" "1000"
@@ -107,7 +108,7 @@ check "job label"        "$($DUCK -readonly "$WORK/job.duckdb" -noheader -list -
 check "job first_day"    "$($DUCK -readonly "$WORK/job.duckdb" -noheader -list -c "select first_day from customer_kpi where id=1")" "20240101"
 
 echo "== 5. ship the processed table back as .bak (only changed table) =="
-$BIN export "$WORK/job.duckdb" --to bak --tables customer_kpi --host "$HOST" --port "$PORT" --user "$USER" --database d2m_kpi --drop-existing \
+$BIN export "$WORK/job.duckdb" --to bak --tables customer_kpi --host "$HOST" --port "$PORT" --user "$USER" --database d2m_kpi --drop-existing --create-database \
      --backup-dir /var/opt/mssql/data --fetch "docker:$CONTAINER" --out "$WORK/d2m_kpi.bak" --verify-restore --drop-staging -q
 check "kpi bak exists"   "$([ -s "$WORK/d2m_kpi.bak" ] && echo yes)" "yes"
 

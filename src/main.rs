@@ -5,6 +5,7 @@ use duckbridge::core::catalog::{open_readonly, read_catalog, CatalogOptions};
 use duckbridge::core::emit::{Emitter, Flavor};
 use duckbridge::core::script::{write_script, ScriptOptions};
 use duckbridge::core::typemap::{StringMode, Target};
+use duckbridge::mssql::guard::Guard;
 use duckbridge::mssql::{self, MssqlTarget};
 use duckbridge::storage::{self, Location};
 use duckbridge::transpile::{self, Dialect};
@@ -206,9 +207,19 @@ struct ExportArgs {
     /// Data path for live loads: TDS bulk copy (fast) or multi-row INSERT (compatible)
     #[arg(long, value_enum, default_value = "bulk")]
     method: MethodArg,
-    /// Include CREATE DATABASE / USE in the generated script
+    /// Live load: create the target database if it does not exist (its name must match the disposable
+    /// pattern). Script: include CREATE DATABASE / USE.
     #[arg(long)]
     create_database: bool,
+    /// Regex of database names duckbridge may create, drop or alter (env DUCKBRIDGE_DISPOSABLE_DB_PATTERN)
+    #[arg(long, default_value = "^_", env = "DUCKBRIDGE_DISPOSABLE_DB_PATTERN")]
+    disposable_db_pattern: String,
+    /// Set the compatibility level of the (disposable) database duckbridge creates, e.g. 150
+    #[arg(long)]
+    compat_level: Option<u16>,
+    /// Set the recovery model of the (disposable) database: simple | full | bulk_logged (default: leave as is)
+    #[arg(long)]
+    recovery: Option<String>,
     /// Directory ON THE SQL SERVER HOST where the .bak is written
     #[arg(long, default_value = "/var/opt/mssql/backup")]
     backup_dir: String,
@@ -289,7 +300,8 @@ fn scratch_dir() -> PathBuf {
 fn main() {
     if let Err(e) = real_main() {
         eprintln!("error: {e:#}");
-        std::process::exit(1);
+        // 1 = a check failed, 2 = could not run, 3 = stopped by the safety guard
+        std::process::exit(duckbridge::core::runlog::exit_code(&e));
     }
 }
 
@@ -464,7 +476,8 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
             use duckbridge::mssql::load::*;
             let em = Emitter::new(Flavor::Mssql, sm);
             let target = a.conn.target("master");
-            let lo = LoadOptions { database: db_name.clone(), drop_existing: a.drop_existing, with_data: !a.schema_only, parallel, batch_rows: a.batch_rows, method: match a.method { MethodArg::Bulk => LoadMethod::Bulk, MethodArg::Insert => LoadMethod::Insert }, recovery_simple: true, pk_after_load: !a.pk_inline, split_threshold: a.split_threshold, order_by_key: a.order_by_key };
+            let guard = Guard::new(Some(&a.disposable_db_pattern))?;
+            let lo = LoadOptions { database: db_name.clone(), drop_existing: a.drop_existing, with_data: !a.schema_only, parallel, batch_rows: a.batch_rows, method: match a.method { MethodArg::Bulk => LoadMethod::Bulk, MethodArg::Insert => LoadMethod::Insert }, guard: guard.clone(), create_database: a.create_database || a.to == ExportKind::Bak, recovery: a.recovery.clone(), compat_level: a.compat_level, pk_after_load: !a.pk_inline, split_threshold: a.split_threshold, order_by_key: a.order_by_key };
             let rt = mssql::runtime()?;
             let mut warnings = vec![];
             let mut c = rt.block_on(async {
@@ -473,7 +486,7 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
                 if let Some(r) = v.first() { log(q, format!("SQL Server {} ({})", r.get::<&str, _>(0).unwrap_or("?"), r.get::<&str, _>(1).unwrap_or("?"))); }
                 prepare_schema(&mut m, &target, &mut cat, &em, &lo).await
             })?;
-            log(q, format!("created database [{db_name}] with {} tables", cat.tables.len()));
+            log(q, format!("prepared database [{db_name}] with {} tables", cat.tables.len()));
             if lo.with_data {
                 let rep = load_data(&con, &cat, &target, &em, &lo, progress.clone())?;
                 warnings.extend(rep.warnings);
@@ -491,14 +504,14 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
                 log(q, format!("backup written on server ({:.1} MB in {:.1}s): {}", br.bytes as f64 / 1e6, br.seconds, br.server_paths.join(", ")));
                 if a.backup_to_url.is_some() {
                     println!("backup written to {}", br.server_paths[0]);
-                    if a.drop_staging { rt.block_on(mssql::exec_batch(&mut m, &format!("ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {0}", mssql::bracket(&db_name))))?; }
+                    if a.drop_staging { rt.block_on(guard.drop_database(&mut m, &db_name))?; }
                     warnings.extend(cat.column_warnings());
                     print_warnings(&warnings);
                     return Ok(());
                 }
                 if a.verify_restore {
                     let vdb = format!("{db_name}_verify");
-                    let counts = rt.block_on(verify_restore(&target, &br.server_paths, &vdb, false))?;
+                    let counts = rt.block_on(verify_restore(&target, &br.server_paths, &vdb, false, &guard))?;
                     let mut mismatches = 0;
                     for t in &cat.tables {
                         let key = format!("{}.{}", em.schema(&t.schema), t.name);
@@ -522,7 +535,7 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
                     println!("wrote {} ({:.1} MB). Restore with: RESTORE DATABASE [{db_name}] FROM DISK = N'<path>' WITH MOVE ..., REPLACE", loc, br.bytes as f64 / 1e6);
                 }
                 if a.drop_staging {
-                    rt.block_on(mssql::exec_batch(&mut m, &format!("ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {0}", mssql::bracket(&db_name))))?;
+                    rt.block_on(guard.drop_database(&mut m, &db_name))?;
                     log(q, format!("dropped staging database [{db_name}]"));
                 }
             } else {

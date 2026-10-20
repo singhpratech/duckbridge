@@ -14,6 +14,7 @@ use crate::core::catalog::{read_catalog, CatalogOptions};
 use crate::core::emit::{Emitter, Flavor};
 use crate::core::script::{write_script, ScriptOptions};
 use crate::core::typemap::{StringMode, Target};
+use crate::mssql::guard::Guard;
 use crate::mssql::{self, MssqlTarget};
 use crate::storage::{self, Location};
 use crate::transpile::{self, Dialect};
@@ -200,16 +201,23 @@ pub struct ExportRequest {
     pub order_by_key: bool,
     pub split_threshold: i64,
     pub batch_rows: usize,
-    /// Script export: include CREATE DATABASE / USE
+    /// Live load: create the target database when missing (name must match the disposable pattern).
+    /// Script export: include CREATE DATABASE / USE.
     pub create_database: bool,
     pub parquet_compression: String,
     /// Label used in script headers
     pub source_label: String,
+    /// Regex of database names DuckBridge may create/drop/alter (default `^_`, env DUCKBRIDGE_DISPOSABLE_DB_PATTERN).
+    pub disposable_db_pattern: Option<String>,
+    /// Set the compatibility level of a (disposable) database it creates.
+    pub compat_level: Option<u16>,
+    /// Set the recovery model (`simple` / `full` / `bulk_logged`) of a (disposable) database.
+    pub recovery: Option<String>,
 }
 
 impl Default for ExportRequest {
     fn default() -> Self {
-        ExportRequest { database: None, tables: vec![], exclude: vec![], schema_map: String::new(), parallel: 0, drop_existing: false, schema_only: false, target_version: 2019, string_mode: "fit".into(), method: "bulk".into(), pk_inline: false, order_by_key: false, split_threshold: 5_000_000, batch_rows: 100_000, create_database: false, parquet_compression: "zstd".into(), source_label: "duckdb".into() }
+        ExportRequest { database: None, tables: vec![], exclude: vec![], schema_map: String::new(), parallel: 0, drop_existing: false, schema_only: false, target_version: 2019, string_mode: "fit".into(), method: "bulk".into(), pk_inline: false, order_by_key: false, split_threshold: 5_000_000, batch_rows: 100_000, create_database: false, parquet_compression: "zstd".into(), source_label: "duckdb".into(), disposable_db_pattern: None, compat_level: None, recovery: None }
     }
 }
 
@@ -254,7 +262,9 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
     let mut cat = catalog_for(con, r, Target::Mssql)?;
     let em = Emitter::new(Flavor::Mssql, parse_schema_map(&r.schema_map, &[("main", "dbo")]));
     let target = dsn.mssql_target(Some("master"));
-    let lo = LoadOptions { database: db_name.clone(), drop_existing: r.drop_existing, with_data: !r.schema_only, parallel: cores(r.parallel), batch_rows: r.batch_rows, method: if r.method.eq_ignore_ascii_case("insert") { LoadMethod::Insert } else { LoadMethod::Bulk }, recovery_simple: true, pk_after_load: !r.pk_inline, split_threshold: r.split_threshold, order_by_key: r.order_by_key };
+    let guard = Guard::new(r.disposable_db_pattern.as_deref())?;
+    // a .bak staging database is created by definition; a plain live load needs create_database
+    let lo = LoadOptions { database: db_name.clone(), drop_existing: r.drop_existing, with_data: !r.schema_only, parallel: cores(r.parallel), batch_rows: r.batch_rows, method: if r.method.eq_ignore_ascii_case("insert") { LoadMethod::Insert } else { LoadMethod::Bulk }, guard: guard.clone(), create_database: r.create_database || bak.is_some(), recovery: r.recovery.clone(), compat_level: r.compat_level, pk_after_load: !r.pk_inline, split_threshold: r.split_threshold, order_by_key: r.order_by_key };
     let rt = mssql::runtime()?;
     let mut warnings = vec![];
     let t0 = std::time::Instant::now();
@@ -284,7 +294,7 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
         if b.to_url.is_none() {
             if b.verify_restore {
                 let vdb = format!("{db_name}_verify");
-                let counts = rt.block_on(verify_restore(&target, &br.server_paths, &vdb, false))?;
+                let counts = rt.block_on(verify_restore(&target, &br.server_paths, &vdb, false, &guard))?;
                 let mut mism = 0;
                 for t in &cat.tables {
                     let key = format!("{}.{}", em.schema(&t.schema), t.name);
@@ -310,7 +320,7 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
             }
         }
         if b.drop_staging {
-            rt.block_on(mssql::exec_batch(&mut m, &format!("ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {0}", mssql::bracket(&db_name))))?;
+            rt.block_on(guard.drop_database(&mut m, &db_name))?;
             out.push(Row::new(format!("[{db_name}]"), "dropped", 0, "staging database dropped"));
         }
     }
