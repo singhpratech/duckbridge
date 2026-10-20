@@ -38,6 +38,42 @@ enum Cmd {
     Export(ExportArgs),
     /// Copy a file between local disk and s3:// az:// gs:// (uses the built-in storage clients)
     Cp { src: String, dst: String },
+    /// Cut over: rename live tables to <live>__old_<timestamp> and new tables to the live names, all or nothing
+    Swap(SwapArgs),
+    /// Drop <table>__old_<timestamp> tables left by swap that are older than a date
+    DropOld(DropOldArgs),
+}
+
+#[derive(Args)]
+struct SwapArgs {
+    #[command(flatten)]
+    conn: ConnArgs,
+    /// Database holding both the new and the live tables
+    #[arg(long, short = 'd')]
+    database: String,
+    /// Pairs new=live, e.g. kpi_new=kpi,dim_new=dbo.dim
+    #[arg(long, value_delimiter = ',')]
+    pairs: Vec<String>,
+    /// SET LOCK_TIMEOUT for the rename transaction, in ms; on timeout everything rolls back and the blockers are listed
+    #[arg(long, default_value_t = 5000)]
+    lock_timeout: i64,
+    /// Keep the old tables as <live>__old_<yyyymmddhhmm> (drop them later with drop-old)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    keep_old: bool,
+}
+
+#[derive(Args)]
+struct DropOldArgs {
+    #[command(flatten)]
+    conn: ConnArgs,
+    #[arg(long, short = 'd')]
+    database: String,
+    /// Drop tables whose __old_ timestamp is before this UTC time: YYYY-MM-DD or "YYYY-MM-DD HH:MM"
+    #[arg(long)]
+    before: String,
+    /// Only this schema
+    #[arg(long)]
+    schema: Option<String>,
 }
 
 #[derive(Args)]
@@ -391,6 +427,8 @@ fn real_main() -> Result<()> {
         Cmd::Run(a) => run(a, q),
         Cmd::Import(a) => import(a, q),
         Cmd::Export(a) => export(a, q),
+        Cmd::Swap(a) => swap_cmd(a),
+        Cmd::DropOld(a) => drop_old_cmd(a),
         Cmd::Cp { src, dst } => {
             let local = localize(&src, q)?;
             let dest = Location::parse(&dst)?;
@@ -400,6 +438,29 @@ fn real_main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn swap_cmd(a: SwapArgs) -> Result<()> {
+    let pairs: Vec<(String, String)> = a.pairs.iter().map(|p| p.split_once('=').map(|(n, l)| (n.trim().to_string(), l.trim().to_string())).ok_or_else(|| anyhow::anyhow!("--pairs expects new=live, got {p:?}"))).collect::<Result<_>>()?;
+    if pairs.is_empty() { bail!("--pairs is required (new=live,...)"); }
+    let rt = mssql::runtime()?;
+    let target = a.conn.target(&a.database);
+    let stmts = rt.block_on(async { let mut c = target.connect(&a.database).await?; duckbridge::mssql::swap::swap(&mut c, &pairs, a.lock_timeout, a.keep_old).await })?;
+    for s in &stmts { println!("{s}"); }
+    println!("swapped {} pair(s) in [{}]{}", pairs.len(), a.database, if a.keep_old { "; old tables kept as <live>__old_<timestamp> (see drop-old)" } else { "" });
+    Ok(())
+}
+
+fn drop_old_cmd(a: DropOldArgs) -> Result<()> {
+    let before = chrono::NaiveDateTime::parse_from_str(a.before.trim(), "%Y-%m-%d %H:%M")
+        .or_else(|_| chrono::NaiveDate::parse_from_str(a.before.trim(), "%Y-%m-%d").map(|d| d.and_hms_opt(0, 0, 0).unwrap()))
+        .with_context(|| format!("--before expects YYYY-MM-DD or 'YYYY-MM-DD HH:MM', got {:?}", a.before))?;
+    let rt = mssql::runtime()?;
+    let target = a.conn.target(&a.database);
+    let dropped = rt.block_on(async { let mut c = target.connect(&a.database).await?; duckbridge::mssql::swap::drop_old(&mut c, a.schema.as_deref(), before).await })?;
+    for d in &dropped { println!("dropped {d}"); }
+    println!("{} old table(s) dropped", dropped.len());
+    Ok(())
 }
 
 fn localize(path: &str, q: bool) -> Result<PathBuf> {
