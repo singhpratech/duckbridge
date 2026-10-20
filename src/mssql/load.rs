@@ -142,6 +142,15 @@ pub fn load_data(con: &Connection, cat: &Catalog, target: &MssqlTarget, em: &Emi
         }
     }
     jobs.sort_by_key(|j| std::cmp::Reverse(cat.tables[j.table].row_count));
+    if crate::core::runlog::planning() {
+        // --plan: describe every bulk job, send nothing
+        for j in &jobs {
+            let t = &cat.tables[j.table];
+            let where_ = match (&j.key, &j.range) { (Some(k), Some(r)) => format!(" WHERE {}", r.predicate(&quote_duck(k))), _ => String::new() };
+            crate::core::runlog::stmt("target", &format!("{}.{}", t.schema, t.name), &format!("BULK INSERT {} ({} rows{}) FROM DuckDB: {}{where_}", em.table_ref(&t.schema, &t.name), t.row_count, if j.range.is_some() { ", key range" } else { "" }, select_sql(t)), t.row_count, std::time::Instant::now());
+        }
+        return Ok(LoadReport { rows: 0, seconds: t0.elapsed().as_secs_f64(), warnings: vec![format!("plan mode: {} bulk job(s) listed, nothing loaded", jobs.len())] });
+    }
     let queue = Arc::new(Mutex::new(jobs));
     let n_workers = o.parallel.max(1).min(queue.lock().unwrap().len().max(1));
     let mut handles = vec![];

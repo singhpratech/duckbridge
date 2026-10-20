@@ -52,6 +52,20 @@ struct InspectArgs {
     tables: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     exclude: Vec<String>,
+    /// nvarchar (default), varchar, or auto: the string type the export would use
+    #[arg(long, default_value = "nvarchar")]
+    string_type: String,
+    /// from-data, max, or a CSV file `table,column,type`
+    #[arg(long, default_value = "from-data")]
+    string_sizes: String,
+}
+
+fn string_sizes_arg(s: &str) -> Result<duckbridge::core::catalog::StringSizes> {
+    Ok(match s.trim().to_lowercase().as_str() {
+        "" | "from-data" | "from_data" | "data" => duckbridge::core::catalog::StringSizes::FromData,
+        "max" => duckbridge::core::catalog::StringSizes::Max,
+        _ => duckbridge::core::catalog::load_string_sizes_file(s.trim())?,
+    })
 }
 
 #[derive(Args)]
@@ -194,6 +208,12 @@ struct ExportArgs {
     /// Size NVARCHAR columns from the data (fit) or always NVARCHAR(MAX) (max)
     #[arg(long, value_enum, default_value = "fit")]
     string_mode: StringModeArg,
+    /// Create mode: nvarchar (default), varchar, or auto (varchar when every value of the column is ASCII)
+    #[arg(long, default_value = "nvarchar")]
+    string_type: String,
+    /// Create mode: from-data (measure), max, or a CSV file `table,column,type` that pins exact types
+    #[arg(long, default_value = "from-data")]
+    string_sizes: String,
     #[arg(long = "schema-map", value_parser = parse_kv)]
     schema_map: Vec<(String, String)>,
     #[arg(long)]
@@ -220,6 +240,18 @@ struct ExportArgs {
     /// Set the recovery model of the (disposable) database: simple | full | bulk_logged (default: leave as is)
     #[arg(long)]
     recovery: Option<String>,
+    /// Show every statement that would be sent (and the bulk jobs) without executing anything
+    #[arg(long)]
+    plan: bool,
+    /// Append one line per statement and event to this file (never stops the run on write errors)
+    #[arg(long)]
+    log: Option<PathBuf>,
+    /// Write a JSON summary (per table/job: rows, seconds, strategy, checks) to this file
+    #[arg(long)]
+    summary: Option<PathBuf>,
+    /// Progress line interval in seconds
+    #[arg(long, default_value_t = 10)]
+    progress_seconds: u64,
     /// Directory ON THE SQL SERVER HOST where the .bak is written
     #[arg(long, default_value = "/var/opt/mssql/backup")]
     backup_dir: String,
@@ -335,7 +367,7 @@ fn localize(path: &str, q: bool) -> Result<PathBuf> {
 fn inspect(a: InspectArgs, q: bool) -> Result<()> {
     let path = localize(&a.duckdb, q)?;
     let con = open_readonly(&path.to_string_lossy())?;
-    let opts = CatalogOptions { include: a.tables, exclude: a.exclude, string_mode: StringMode::Fit, target: match a.target { TargetArg::Mssql => Target::Mssql, TargetArg::Postgres => Target::Postgres }, measure: true };
+    let opts = CatalogOptions { include: a.tables, exclude: a.exclude, string_mode: StringMode::Fit, target: match a.target { TargetArg::Mssql => Target::Mssql, TargetArg::Postgres => Target::Postgres }, measure: true, string_type: duckbridge::core::typemap::StringType::parse(&a.string_type)?, string_sizes: string_sizes_arg(&a.string_sizes)? };
     let cat = read_catalog(&con, &a.duckdb, &opts)?;
     if a.json {
         println!("{}", serde_json::to_string_pretty(&cat)?);
@@ -440,12 +472,19 @@ fn import(a: ImportArgs, q: bool) -> Result<()> {
 }
 
 fn export(a: ExportArgs, q: bool) -> Result<()> {
+    duckbridge::core::runlog::init(a.log.as_deref(), a.summary.as_deref(), a.plan, a.progress_seconds);
+    let r = export_inner(a, q);
+    let _ = duckbridge::core::runlog::finish(r.is_ok());
+    r
+}
+
+fn export_inner(a: ExportArgs, q: bool) -> Result<()> {
     let path = localize(&a.duckdb, q)?;
     duckbridge::core::typemap::set_mssql_version(a.target_version);
     let con = open_readonly(&path.to_string_lossy())?;
     if let Some(m) = &a.memory_limit { con.execute_batch(&format!("SET memory_limit='{m}'"))?; }
     let target_kind = if matches!(a.to, ExportKind::Postgres | ExportKind::Parquet) { Target::Postgres } else { Target::Mssql };
-    let opts = CatalogOptions { include: a.tables.clone(), exclude: a.exclude.clone(), string_mode: match a.string_mode { StringModeArg::Fit => StringMode::Fit, StringModeArg::Max => StringMode::Max }, target: target_kind, measure: true };
+    let opts = CatalogOptions { include: a.tables.clone(), exclude: a.exclude.clone(), string_mode: match a.string_mode { StringModeArg::Fit => StringMode::Fit, StringModeArg::Max => StringMode::Max }, target: target_kind, measure: true, string_type: duckbridge::core::typemap::StringType::parse(&a.string_type)?, string_sizes: string_sizes_arg(&a.string_sizes)? };
     let mut cat = read_catalog(&con, &a.duckdb, &opts)?;
     log(q, format!("source: DuckDB {}  {} tables, {} views, {} rows", cat.duckdb_version, cat.tables.len(), cat.views.len(), cat.total_rows()));
     let default_map = if matches!(a.to, ExportKind::Postgres | ExportKind::Parquet) { [("main", "public")] } else { [("main", "dbo")] };
@@ -493,6 +532,16 @@ fn export(a: ExportArgs, q: bool) -> Result<()> {
                 log(q, format!("loaded {} rows in {:.1}s ({:.0} rows/s)", rep.rows, rep.seconds, rep.rows as f64 / rep.seconds.max(0.001)));
             }
             rt.block_on(finish_schema(&mut c, &cat, &em, &lo, &mut warnings))?;
+            drop(c); // no session of ours stays attached to the database
+            if a.plan {
+                let stmts = duckbridge::core::runlog::planned_statements();
+                println!("-- PLAN for [{db_name}] on {}:{} ({} statements; nothing was executed)", a.conn.host, a.conn.port, stmts.len());
+                for (i, s) in stmts.iter().enumerate() { println!("{:>4}  {s}", i + 1); }
+                warnings.extend(cat.column_warnings());
+                print_warnings(&warnings);
+                return Ok(());
+            }
+            for t in &cat.tables { duckbridge::core::runlog::summary_add(duckbridge::core::runlog::SummaryEntry { table: format!("{}.{}", em.schema(&t.schema), t.name), job: "table".into(), rows: t.row_count, seconds: 0.0, strategy: "serial".into(), checks: vec![], ok: true }); }
             log(q, "constraints, indexes and views created");
             if a.to == ExportKind::Bak {
                 use duckbridge::mssql::backup::*;

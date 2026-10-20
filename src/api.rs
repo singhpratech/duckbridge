@@ -195,6 +195,10 @@ pub struct ExportRequest {
     pub target_version: u16,
     /// "fit" (size NVARCHAR from the data) or "max"
     pub string_mode: String,
+    /// Create mode: "nvarchar" (default), "varchar", or "auto" (varchar when every value is ASCII)
+    pub string_type: String,
+    /// Create mode: "from-data" (default), "max", or a CSV file `table,column,type` pinning exact types
+    pub string_sizes: String,
     /// "bulk" or "insert"
     pub method: String,
     pub pk_inline: bool,
@@ -213,11 +217,18 @@ pub struct ExportRequest {
     pub compat_level: Option<u16>,
     /// Set the recovery model (`simple` / `full` / `bulk_logged`) of a (disposable) database.
     pub recovery: Option<String>,
+    /// Plan only: record every statement, send no DDL or data (spec R8.1).
+    pub plan: bool,
+    /// Append one line per statement/event to this file.
+    pub log_file: Option<String>,
+    /// Write a JSON summary (per table/job) to this file at the end.
+    pub summary_file: Option<String>,
+    pub progress_seconds: u64,
 }
 
 impl Default for ExportRequest {
     fn default() -> Self {
-        ExportRequest { database: None, tables: vec![], exclude: vec![], schema_map: String::new(), parallel: 0, drop_existing: false, schema_only: false, target_version: 2019, string_mode: "fit".into(), method: "bulk".into(), pk_inline: false, order_by_key: false, split_threshold: 5_000_000, batch_rows: 100_000, create_database: false, parquet_compression: "zstd".into(), source_label: "duckdb".into(), disposable_db_pattern: None, compat_level: None, recovery: None }
+        ExportRequest { database: None, tables: vec![], exclude: vec![], schema_map: String::new(), parallel: 0, drop_existing: false, schema_only: false, target_version: 2019, string_mode: "fit".into(), string_type: "nvarchar".into(), string_sizes: "from-data".into(), method: "bulk".into(), pk_inline: false, order_by_key: false, split_threshold: 5_000_000, batch_rows: 100_000, create_database: false, parquet_compression: "zstd".into(), source_label: "duckdb".into(), disposable_db_pattern: None, compat_level: None, recovery: None, plan: false, log_file: None, summary_file: None, progress_seconds: 10 }
     }
 }
 
@@ -244,7 +255,8 @@ impl Default for BakRequest {
 
 fn catalog_for(con: &Connection, r: &ExportRequest, target: Target) -> Result<crate::core::model::Catalog> {
     crate::core::typemap::set_mssql_version(r.target_version);
-    let opts = CatalogOptions { include: r.tables.clone(), exclude: r.exclude.clone(), string_mode: if r.string_mode.eq_ignore_ascii_case("max") { StringMode::Max } else { StringMode::Fit }, target, measure: true };
+    let string_sizes = match r.string_sizes.trim().to_lowercase().as_str() { "" | "from-data" | "from_data" | "data" => crate::core::catalog::StringSizes::FromData, "max" => crate::core::catalog::StringSizes::Max, _ => crate::core::catalog::load_string_sizes_file(r.string_sizes.trim())? };
+    let opts = CatalogOptions { include: r.tables.clone(), exclude: r.exclude.clone(), string_mode: if r.string_mode.eq_ignore_ascii_case("max") { StringMode::Max } else { StringMode::Fit }, target, measure: true, string_type: crate::core::typemap::StringType::parse(&r.string_type)?, string_sizes };
     read_catalog(con, &r.source_label, &opts)
 }
 
@@ -262,6 +274,7 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
     let mut cat = catalog_for(con, r, Target::Mssql)?;
     let em = Emitter::new(Flavor::Mssql, parse_schema_map(&r.schema_map, &[("main", "dbo")]));
     let target = dsn.mssql_target(Some("master"));
+    crate::core::runlog::init(r.log_file.as_deref().map(std::path::Path::new), r.summary_file.as_deref().map(std::path::Path::new), r.plan, r.progress_seconds);
     let guard = Guard::new(r.disposable_db_pattern.as_deref())?;
     // a .bak staging database is created by definition; a plain live load needs create_database
     let lo = LoadOptions { database: db_name.clone(), drop_existing: r.drop_existing, with_data: !r.schema_only, parallel: cores(r.parallel), batch_rows: r.batch_rows, method: if r.method.eq_ignore_ascii_case("insert") { LoadMethod::Insert } else { LoadMethod::Bulk }, guard: guard.clone(), create_database: r.create_database || bak.is_some(), recovery: r.recovery.clone(), compat_level: r.compat_level, pk_after_load: !r.pk_inline, split_threshold: r.split_threshold, order_by_key: r.order_by_key };
@@ -280,6 +293,15 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
         total = rep.rows;
     }
     rt.block_on(finish_schema(&mut c, &cat, &em, &lo, &mut warnings))?;
+    drop(c); // no session of ours stays attached to the database
+    if r.plan {
+        let mut out: Vec<Row> = crate::core::runlog::planned_statements().into_iter().enumerate().map(|(i, s)| Row::new(format!("#{}", i + 1), "plan", 0, s)).collect();
+        out.push(Row::new(format!("[{db_name}]"), "summary", 0, format!("plan only: {} statement(s), nothing executed", out.len())));
+        out.extend(warnings.iter().chain(cat.column_warnings().iter()).map(|w| Row::warn(w)));
+        let _ = crate::core::runlog::finish(true);
+        return Ok(out);
+    }
+    for t in &cat.tables { crate::core::runlog::summary_add(crate::core::runlog::SummaryEntry { table: format!("{}.{}", em.schema(&t.schema), t.name), job: "table".into(), rows: t.row_count, seconds: 0.0, strategy: "serial".into(), checks: vec![], ok: true }); }
     let mut out = table_rows(&cat, &em, lo.with_data);
     let secs = t0.elapsed().as_secs_f64();
     out.push(Row::new(format!("[{db_name}]"), "summary", total, format!("loaded on {}:{} in {:.1}s ({:.0} rows/s)", target.host, target.port, secs, total as f64 / secs.max(0.001))));
@@ -326,6 +348,7 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
     }
     warnings.extend(cat.column_warnings());
     out.extend(warnings.iter().map(|w| Row::warn(w)));
+    crate::core::runlog::finish(true)?;
     Ok(out)
 }
 

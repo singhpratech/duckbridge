@@ -97,6 +97,12 @@ impl Guard {
         }).collect())
     }
 
+    /// The client host name of this connection as the server sees it.
+    async fn my_host(c: &mut MsClient) -> Result<String> {
+        let rows = c.simple_query("SELECT ISNULL(host_name, '') FROM sys.dm_exec_sessions WHERE session_id = @@SPID").await?.into_first_result().await?;
+        Ok(rows.first().and_then(|r| r.get::<&str, _>(0)).unwrap_or("").to_string())
+    }
+
     /// R1.5: the target must exist, unless `create` is set *and* the name is disposable.
     pub async fn ensure_database(&self, c: &mut MsClient, db: &str, create: bool) -> Result<()> {
         if Self::exists(c, db).await? { return Ok(()); }
@@ -111,7 +117,16 @@ impl Guard {
     pub async fn drop_database(&self, c: &mut MsClient, db: &str) -> Result<()> {
         self.assert_disposable(db, "DROP DATABASE")?;
         if !Self::exists(c, db).await? { return Ok(()); }
-        let others = Self::sessions(c, db).await?;
+        // Connections this process just closed can linger for a moment on the server. Sessions that
+        // look like ours (same program name and client host) get a short grace period; anything else
+        // is refused immediately.
+        let me = Self::my_host(c).await?;
+        let mut others = Self::sessions(c, db).await?;
+        for _ in 0..20 {
+            if others.is_empty() || !others.iter().all(|s| s.program_name == "duckbridge" && s.host_name == me) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            others = Self::sessions(c, db).await?;
+        }
         if !others.is_empty() {
             let list: Vec<String> = others.iter().take(20).map(|s| format!("session {} ({} from {} via {}, {})", s.session_id, s.login_name, s.host_name, s.program_name, s.status)).collect();
             return Err(Failure::Guard(format!("refusing DROP DATABASE on '{db}': {} other session(s) connected: {}", others.len(), list.join("; "))).into());

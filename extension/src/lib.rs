@@ -193,6 +193,8 @@ impl VTab for ExportVTab {
             schema_only: b_param(bind, "schema_only", false),
             target_version: i_param(bind, "target_version", 2019) as u16,
             string_mode: s_param(bind, "string_mode").unwrap_or(d.string_mode),
+            string_type: s_param(bind, "string_type").unwrap_or(d.string_type),
+            string_sizes: s_param(bind, "string_sizes").unwrap_or(d.string_sizes),
             method: s_param(bind, "method").unwrap_or(d.method),
             pk_inline: b_param(bind, "pk_inline", false),
             order_by_key: b_param(bind, "order_by_key", false),
@@ -201,6 +203,13 @@ impl VTab for ExportVTab {
             create_database: b_param(bind, "create_database", false),
             parquet_compression: s_param(bind, "parquet_compression").unwrap_or(d.parquet_compression),
             source_label: "duckdb".into(),
+            disposable_db_pattern: s_param(bind, "disposable_db_pattern"),
+            compat_level: bind.get_named_parameter("compat_level").map(|_| i_param(bind, "compat_level", 0) as u16),
+            recovery: s_param(bind, "recovery"),
+            plan: b_param(bind, "plan", false),
+            log_file: s_param(bind, "log_file"),
+            summary_file: s_param(bind, "summary_file"),
+            progress_seconds: d.progress_seconds,
         };
         let bd = api::BakRequest::default();
         let wants_bak = bind.get_named_parameter("bak").is_some() || b_param(bind, "verify_restore", false) || s_param(bind, "backup_to_url").is_some();
@@ -245,6 +254,8 @@ impl VTab for ExportVTab {
             ("parallel", bigint()), ("drop_existing", boolean()), ("schema_only", boolean()), ("target_version", bigint()),
             ("string_mode", varchar()), ("method", varchar()), ("pk_inline", boolean()), ("order_by_key", boolean()),
             ("split_threshold", bigint()), ("batch_rows", bigint()), ("create_database", boolean()),
+            ("disposable_db_pattern", varchar()), ("compat_level", bigint()), ("recovery", varchar()),
+            ("plan", boolean()), ("log_file", varchar()), ("summary_file", varchar()), ("string_type", varchar()), ("string_sizes", varchar()),
             ("parquet_compression", varchar()),
             ("bak", varchar()), ("backup_dir", varchar()), ("fetch_via", varchar()), ("stripes", bigint()),
             ("compression", boolean()), ("verify_restore", boolean()), ("drop_staging", boolean()), ("backup_to_url", varchar()),

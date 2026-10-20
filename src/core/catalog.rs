@@ -1,11 +1,44 @@
 //! Read the DuckDB catalog into the neutral model.
 use super::model::*;
-use super::typemap::{map_column, parse_type, quote_duck, StringMode, Target};
+use super::typemap::{map_column_with, parse_type, quote_duck, StringMode, StringType, Target};
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use std::collections::HashMap;
 
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "system", "temp"];
+
+/// How string column sizes are chosen.
+#[derive(Debug, Clone, Default)]
+pub enum StringSizes {
+    /// Measure the data (default).
+    #[default]
+    FromData,
+    /// Always (N)VARCHAR(MAX) (keys are still sized).
+    Max,
+    /// "table.column" (or "schema.table.column"), lowercase -> exact SQL Server type text.
+    File(HashMap<String, String>),
+}
+
+/// Parse a CSV `table,column,type` (optional header). `table` may be `schema.table` or bare.
+pub fn load_string_sizes_file(path: &str) -> Result<StringSizes> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading string sizes file {path}"))?;
+    let mut map = HashMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(3, ',').map(|p| p.trim().trim_matches('"')).collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+            anyhow::bail!("{path}:{}: expected table,column,type", n + 1);
+        }
+        if n == 0 && parts[0].eq_ignore_ascii_case("table") && parts[1].eq_ignore_ascii_case("column") {
+            continue;
+        }
+        map.insert(format!("{}.{}", parts[0], parts[1]).to_lowercase(), parts[2].to_string());
+    }
+    Ok(StringSizes::File(map))
+}
 
 pub struct CatalogOptions {
     pub include: Vec<String>,
@@ -13,11 +46,13 @@ pub struct CatalogOptions {
     pub string_mode: StringMode,
     pub target: Target,
     pub measure: bool,
+    pub string_type: StringType,
+    pub string_sizes: StringSizes,
 }
 
 impl Default for CatalogOptions {
     fn default() -> Self {
-        Self { include: vec![], exclude: vec![], string_mode: StringMode::Fit, target: Target::Mssql, measure: true }
+        Self { include: vec![], exclude: vec![], string_mode: StringMode::Fit, target: Target::Mssql, measure: true, string_type: StringType::Nvarchar, string_sizes: StringSizes::FromData }
     }
 }
 
@@ -127,14 +162,17 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
     }
 
     // measurements + mapping
+    let mode = if matches!(o.string_sizes, StringSizes::Max) { StringMode::Max } else { o.string_mode };
+    let auto = o.string_type == StringType::Auto;
     for t in &mut tables {
+        let mut ascii: HashMap<usize, bool> = HashMap::new();
         let fq = format!("{}.{}", quote_duck(&t.schema), quote_duck(&t.name));
         t.row_count = con.query_row(&format!("select count(*) from {fq}"), [], |r| r.get(0))?;
         if o.measure && t.row_count > 0 {
             let keys = t.key_columns();
             let idx: Vec<usize> = t.columns.iter().enumerate()
                 .filter(|(_, c)| match parse_type(&c.duck_type).0.as_str() {
-                    "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" => o.string_mode == StringMode::Fit || keys.contains(&c.name),
+                    "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" => mode == StringMode::Fit || auto || keys.contains(&c.name),
                     "HUGEINT" | "UHUGEINT" | "VARINT" | "BIGNUM" => true,
                     _ => false,
                 })
@@ -142,25 +180,53 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
             if !idx.is_empty() {
                 // strings: upper bound on UTF-16 code units (NVARCHAR(n) counts byte-pairs): chars + extra_bytes/3 >= chars + supplementary chars
                 // big integers: digits without the sign
-                let sel: Vec<String> = idx.iter().map(|i| {
+                let mut sel: Vec<String> = Vec::new();
+                let mut ascii_at: Vec<(usize, usize)> = Vec::new(); // (column index, position in select list)
+                for i in &idx {
                     let c = &t.columns[*i];
                     let q = quote_duck(&c.name);
                     match parse_type(&c.duck_type).0.as_str() {
-                        "HUGEINT" | "UHUGEINT" | "VARINT" | "BIGNUM" => format!("max(length(replace(CAST({q} AS VARCHAR), '-', '')))"),
-                        _ => format!("max(length({q}) + (strlen({q}) - length({q})) / 3)"),
+                        "HUGEINT" | "UHUGEINT" | "VARINT" | "BIGNUM" => sel.push(format!("max(length(replace(CAST({q} AS VARCHAR), '-', '')))")),
+                        _ => sel.push(format!("max(length({q}) + (strlen({q}) - length({q})) / 3)")),
                     }
-                }).collect();
+                }
+                if auto {
+                    for i in &idx {
+                        let c = &t.columns[*i];
+                        if !matches!(parse_type(&c.duck_type).0.as_str(), "HUGEINT" | "UHUGEINT" | "VARINT" | "BIGNUM") {
+                            let q = quote_duck(&c.name);
+                            ascii_at.push((*i, sel.len()));
+                            sel.push(format!("bool_and({q} IS NULL OR strlen({q}) = length({q}))"));
+                        }
+                    }
+                }
                 let sql = format!("select {} from {fq}", sel.join(", "));
-                let vals: Vec<Option<i64>> = con.query_row(&sql, [], |r| (0..idx.len()).map(|i| r.get(i)).collect())?;
+                let n_len = idx.len();
+                let (vals, flags): (Vec<Option<i64>>, Vec<Option<bool>>) = con.query_row(&sql, [], |r| {
+                    let v = (0..n_len).map(|i| r.get(i)).collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
+                    let f = (n_len..sel.len()).map(|i| r.get(i)).collect::<std::result::Result<Vec<Option<bool>>, _>>()?;
+                    Ok((v, f))
+                })?;
                 for (i, v) in idx.iter().zip(vals) {
                     t.columns[*i].max_len = Some(v.unwrap_or(0) as usize);
+                }
+                for (ci, pos) in ascii_at {
+                    ascii.insert(ci, flags[pos - n_len].unwrap_or(true));
                 }
             }
         }
         let keys = t.key_columns();
-        for c in &mut t.columns {
+        let (tschema, tname) = (t.schema.to_lowercase(), t.name.to_lowercase());
+        for (ci, c) in t.columns.iter_mut().enumerate() {
             let is_key = keys.contains(&c.name);
-            map_column(c, is_key, o.string_mode, o.target);
+            let pinned = match &o.string_sizes {
+                StringSizes::File(m) => {
+                    let cn = c.name.to_lowercase();
+                    m.get(&format!("{tschema}.{tname}.{cn}")).or_else(|| m.get(&format!("{tname}.{cn}"))).map(|s| s.as_str())
+                }
+                _ => None,
+            };
+            map_column_with(c, is_key, mode, o.target, o.string_type, ascii.get(&ci).copied(), pinned);
         }
     }
 
@@ -223,4 +289,57 @@ fn index_columns(exprs: &[String], sql: Option<&str>) -> Option<Vec<String>> {
     let open = sql.rfind('(')?;
     let close = sql.rfind(')')?;
     Some(sql[open + 1..close].split(',').map(|p| p.trim().trim_matches('"').to_string()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_string_type_measures_ascii() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch("create table t(a varchar, b varchar); insert into t values ('abc','h\u{00e9}llo'),(NULL,'x');").unwrap();
+        let o = CatalogOptions { string_type: StringType::Auto, ..Default::default() };
+        let cat = read_catalog(&con, "mem", &o).unwrap();
+        let t = &cat.tables[0];
+        assert!(t.columns[0].sql_type.starts_with("VARCHAR("), "{}", t.columns[0].sql_type);
+        assert!(t.columns[1].sql_type.starts_with("NVARCHAR("), "{}", t.columns[1].sql_type);
+        assert!(t.columns[0].warnings.iter().any(|w| w.contains("auto string type: varchar")));
+        assert!(t.columns[1].warnings.iter().any(|w| w.contains("non-ASCII")));
+        // default: unchanged
+        let cat = read_catalog(&con, "mem", &CatalogOptions::default()).unwrap();
+        assert!(cat.tables[0].columns[0].sql_type.starts_with("NVARCHAR("));
+        assert!(cat.tables[0].columns[0].warnings.is_empty());
+    }
+
+    #[test]
+    fn pinned_and_max_sizes() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch("create table t(a varchar, b varchar); insert into t values ('abc','x');").unwrap();
+        let mut m = HashMap::new();
+        m.insert("t.a".to_string(), "varchar(12)".to_string());
+        let o = CatalogOptions { string_sizes: StringSizes::File(m), ..Default::default() };
+        let cat = read_catalog(&con, "mem", &o).unwrap();
+        assert_eq!(cat.tables[0].columns[0].sql_type, "varchar(12)");
+        assert_eq!(cat.tables[0].columns[1].sql_type, "NVARCHAR(50)");
+        let o = CatalogOptions { string_sizes: StringSizes::Max, string_type: StringType::Varchar, ..Default::default() };
+        let cat = read_catalog(&con, "mem", &o).unwrap();
+        assert_eq!(cat.tables[0].columns[1].sql_type, "VARCHAR(MAX)");
+    }
+
+    #[test]
+    fn sizes_file_parses() {
+        let dir = std::env::temp_dir().join(format!("d2m_sizes_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("s.csv");
+        std::fs::write(&f, "table,column,type\nmain.T1,Name,varchar(12)\nt2,C,nvarchar(50)\n").unwrap();
+        match load_string_sizes_file(f.to_str().unwrap()).unwrap() {
+            StringSizes::File(m) => {
+                assert_eq!(m["main.t1.name"], "varchar(12)");
+                assert_eq!(m["t2.c"], "nvarchar(50)");
+            }
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

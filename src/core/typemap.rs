@@ -21,6 +21,27 @@ pub enum StringMode {
     Max,
 }
 
+/// Which SQL Server character type string columns map to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StringType {
+    Varchar,
+    #[default]
+    Nvarchar,
+    /// VARCHAR when every value is ASCII, else NVARCHAR (decided per column from the data).
+    Auto,
+}
+
+impl StringType {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "varchar" => Ok(Self::Varchar),
+            "nvarchar" => Ok(Self::Nvarchar),
+            "auto" => Ok(Self::Auto),
+            o => anyhow::bail!("invalid string type {o:?} (expected varchar, nvarchar or auto)"),
+        }
+    }
+}
+
 const BUCKETS: [usize; 7] = [50, 100, 255, 500, 1000, 2000, 4000];
 
 fn bucket(n: usize) -> Option<usize> {
@@ -53,6 +74,11 @@ pub fn quote_duck(ident: &str) -> String {
 }
 
 pub fn map_column(col: &mut Column, is_key: bool, mode: StringMode, target: Target) {
+    map_column_with(col, is_key, mode, target, StringType::Nvarchar, None, None)
+}
+
+/// `is_ascii`: measured "every value is ASCII" (used by `Auto`); `pinned`: exact SQL Server type text.
+pub fn map_column_with(col: &mut Column, is_key: bool, mode: StringMode, target: Target, string_type: StringType, is_ascii: Option<bool>, pinned: Option<&str>) {
     let q = quote_duck(&col.name);
     col.select_expr = q.clone();
     col.conv = Conv::Identity;
@@ -90,7 +116,7 @@ pub fn map_column(col: &mut Column, is_key: bool, mode: StringMode, target: Targ
             let s = it.next().unwrap_or(3);
             (format!("DECIMAL({p},{s})"), Conv::Identity)
         }
-        "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" => (nvarchar(col.max_len, is_key, mode, &mut col.warnings), Conv::Text),
+        "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" => (string_col(col.max_len, is_key, mode, string_type, is_ascii, pinned, &mut col.warnings), Conv::Text),
         "BLOB" | "BYTEA" => {
             if is_key {
                 w.push("BLOB used in a key: sized VARBINARY(900)".into());
@@ -175,6 +201,40 @@ pub fn map_column(col: &mut Column, is_key: bool, mode: StringMode, target: Targ
     if is_key && col.sql_type.ends_with("(MAX)") {
         col.sql_type = col.sql_type.replace("(MAX)", "(450)");
         col.warnings.push("MAX type used in key/index: sized to 450 characters".into());
+    }
+}
+
+fn string_col(max_len: Option<usize>, is_key: bool, mode: StringMode, st: StringType, is_ascii: Option<bool>, pinned: Option<&str>, w: &mut Vec<String>) -> String {
+    if let Some(p) = pinned {
+        w.push("type pinned by --string-sizes file".into());
+        return p.trim().to_string();
+    }
+    let narrow = match st {
+        StringType::Varchar => true,
+        StringType::Nvarchar => false,
+        StringType::Auto => {
+            let a = is_ascii == Some(true);
+            w.push(if a { "auto string type: varchar (all values ASCII)".into() } else { "auto string type: nvarchar (non-ASCII values present)".to_string() });
+            a
+        }
+    };
+    if narrow { varchar(max_len, is_key, mode, w) } else { nvarchar(max_len, is_key, mode, w) }
+}
+
+fn varchar(max_len: Option<usize>, is_key: bool, mode: StringMode, w: &mut Vec<String>) -> String {
+    if is_key {
+        let n = max_len.unwrap_or(1).max(1);
+        return match bucket(n) {
+            Some(b) if b <= 900 => format!("VARCHAR({b})"),
+            _ => {
+                w.push("string key column longer than 900 bytes; sized VARCHAR(900), may fail".into());
+                "VARCHAR(900)".into()
+            }
+        };
+    }
+    match (mode, max_len) {
+        (StringMode::Max, _) | (_, None) => "VARCHAR(MAX)".into(),
+        (StringMode::Fit, Some(n)) => bucket(n.max(1)).map(|b| format!("VARCHAR({b})")).unwrap_or("VARCHAR(MAX)".into()),
     }
 }
 
@@ -320,5 +380,67 @@ pub fn mssql_to_duck(type_name: &str, max_length: i16, precision: u8, scale: u8)
             let _ = max_length;
             ("VARCHAR".into(), w(&format!("unknown SQL Server type {t}; stored as VARCHAR")))
         }
+    }
+}
+
+#[cfg(test)]
+mod string_type_tests {
+    use super::*;
+
+    fn col(max_len: Option<usize>) -> Column {
+        Column {
+            name: "c".into(), duck_type: "VARCHAR".into(), nullable: true, default: None, comment: None,
+            sql_type: String::new(), select_expr: String::new(), conv: Conv::Identity,
+            max_len, identity: None, enum_values: None, warnings: vec![],
+        }
+    }
+    fn run(max_len: Option<usize>, key: bool, mode: StringMode, st: StringType, ascii: Option<bool>, pin: Option<&str>) -> Column {
+        let mut c = col(max_len);
+        map_column_with(&mut c, key, mode, Target::Mssql, st, ascii, pin);
+        c
+    }
+
+    #[test]
+    fn parse_works() {
+        assert_eq!(StringType::parse("Auto").unwrap(), StringType::Auto);
+        assert_eq!(StringType::parse("varchar").unwrap(), StringType::Varchar);
+        assert!(StringType::parse("x").is_err());
+        assert_eq!(StringType::default(), StringType::Nvarchar);
+    }
+    #[test]
+    fn varchar_and_nvarchar() {
+        assert_eq!(run(Some(10), false, StringMode::Fit, StringType::Varchar, None, None).sql_type, "VARCHAR(50)");
+        assert_eq!(run(Some(10), false, StringMode::Fit, StringType::Nvarchar, None, None).sql_type, "NVARCHAR(50)");
+        assert_eq!(run(Some(10), false, StringMode::Max, StringType::Varchar, None, None).sql_type, "VARCHAR(MAX)");
+        assert_eq!(run(Some(9000), false, StringMode::Fit, StringType::Varchar, None, None).sql_type, "VARCHAR(MAX)");
+    }
+    #[test]
+    fn auto_decides() {
+        let a = run(Some(10), false, StringMode::Fit, StringType::Auto, Some(true), None);
+        assert_eq!(a.sql_type, "VARCHAR(50)");
+        assert!(a.warnings.iter().any(|w| w.contains("auto string type: varchar")));
+        let b = run(Some(10), false, StringMode::Fit, StringType::Auto, Some(false), None);
+        assert_eq!(b.sql_type, "NVARCHAR(50)");
+        assert!(b.warnings.iter().any(|w| w.contains("nvarchar (non-ASCII")));
+        assert_eq!(run(Some(10), false, StringMode::Max, StringType::Auto, Some(true), None).sql_type, "VARCHAR(MAX)");
+        assert_eq!(run(Some(10), false, StringMode::Max, StringType::Auto, None, None).sql_type, "NVARCHAR(MAX)");
+        assert!(run(Some(10), false, StringMode::Fit, StringType::Nvarchar, None, None).warnings.is_empty());
+    }
+    #[test]
+    fn key_sizing_limits() {
+        let c = run(Some(500), true, StringMode::Fit, StringType::Varchar, None, None);
+        assert_eq!(c.sql_type, "VARCHAR(500)");
+        let c = run(Some(2000), true, StringMode::Fit, StringType::Varchar, None, None);
+        assert_eq!(c.sql_type, "VARCHAR(900)");
+        assert!(!c.warnings.is_empty());
+        assert_eq!(run(Some(500), true, StringMode::Fit, StringType::Nvarchar, None, None).sql_type, "NVARCHAR(450)");
+    }
+    #[test]
+    fn pinned() {
+        let c = run(Some(10), false, StringMode::Fit, StringType::Auto, Some(true), Some("varchar(12)"));
+        assert_eq!(c.sql_type, "varchar(12)");
+        assert_eq!(c.conv, Conv::Text);
+        assert!(c.warnings.iter().any(|w| w == "type pinned by --string-sizes file"));
+        assert!(!c.warnings.iter().any(|w| w.contains("auto string type")));
     }
 }
