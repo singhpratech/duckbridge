@@ -7,6 +7,7 @@ pub mod guard;
 pub mod import;
 pub mod jobs;
 pub mod load;
+pub mod loadx;
 pub mod split;
 pub mod swap;
 pub mod switch;

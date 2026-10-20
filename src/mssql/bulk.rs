@@ -792,31 +792,6 @@ mod tests {
                 let secs = t0.elapsed().as_secs_f64();
                 println!("bulk_live_throughput: {n} rows (17 columns, heap, TABLOCK, batch {batch_rows}) in {secs:.2} s = {:.0} rows/s", n as f64 / secs);
             }
-            {
-                // the 0.1.0 path for comparison: materialized query, per-cell get_ref, load::to_column_data
-                crate::mssql::exec_batch(&mut c, "TRUNCATE TABLE dbo.c_tp").await.unwrap();
-                let model: Vec<crate::core::model::Column> = names.iter().zip(crate::mssql::convert::tests::bench_types()).map(|(n, t)| crate::core::model::Column {
-                    name: n.clone(), duck_type: String::new(), nullable: true, default: None, comment: None, sql_type: t.to_string(), select_expr: n.clone(),
-                    conv: crate::core::model::Conv::Identity, max_len: None, identity: None, enum_values: None, warnings: vec![] }).collect();
-                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                let t0 = Instant::now();
-                let mut st = con.prepare("SELECT * FROM b").unwrap();
-                let mut rs = st.query([]).unwrap();
-                let opts = SqlBulkCopyOptions::from(SqlBulkCopyOption::TableLock);
-                let mut req = c.bulk_insert_with_options("dbo.c_tp", &refs, opts, &[]).await.unwrap();
-                let (mut n, mut in_batch) = (0i64, 0usize);
-                while let Some(r) = rs.next().unwrap() {
-                    let mut row = TokenRow::new();
-                    for (i, col) in model.iter().enumerate() { row.push(crate::mssql::load::to_column_data(r.get_ref_unwrap(i), col).unwrap()); }
-                    req.send(row).await.unwrap();
-                    n += 1;
-                    in_batch += 1;
-                    if in_batch >= 100_000 { req.finalize().await.unwrap(); req = c.bulk_insert_with_options("dbo.c_tp", &refs, opts, &[]).await.unwrap(); in_batch = 0; }
-                }
-                req.finalize().await.unwrap();
-                let secs = t0.elapsed().as_secs_f64();
-                println!("bulk_live_throughput: 0.1.0 path (load::to_column_data): {n} rows in {secs:.2} s = {:.0} rows/s", n as f64 / secs);
-            }
             crate::mssql::exec_batch(&mut c, "DROP TABLE dbo.c_tp").await.unwrap();
         });
     }

@@ -381,6 +381,49 @@ struct ExportArgs {
     /// Progress line interval in seconds
     #[arg(long, default_value_t = 10)]
     progress_seconds: u64,
+    // ---- loads into existing production tables (spec R2, R4, R9) ----
+    /// Load into tables that already exist: no DDL on the target, columns mapped by name, types checked first
+    #[arg(long)]
+    into_existing: bool,
+    /// --into-existing: DuckDB columns with no target column are skipped instead of failing
+    #[arg(long)]
+    ignore_extra_columns: bool,
+    /// --into-existing: allow a source DECIMAL scale larger than the target's (values are rounded)
+    #[arg(long)]
+    allow_rescale: bool,
+    /// --into-existing: run the pre-flight checks only, move no data
+    #[arg(long)]
+    check_only: bool,
+    /// --into-existing: check primary-key duplicates in DuckDB before loading: full | hash
+    #[arg(long)]
+    check_pk: Option<String>,
+    /// Split a table into jobs: table=column:<col> | files:<glob> | hash:<cols>:<n> | range:<col>:<n> (repeatable)
+    #[arg(long = "split")]
+    splits: Vec<String>,
+    /// Load strategy per table: table=switch | heap-then-index | serial ('*' for all; repeatable)
+    #[arg(long = "strategy")]
+    strategies: Vec<String>,
+    /// Keep one table from taking every worker slot
+    #[arg(long)]
+    max_jobs_per_table: Option<usize>,
+    /// Directory for done markers; rerunning with the same directory resumes a killed load
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// switch strategy: a non-empty target partition is switched out to <table>__old_<value> instead of failing
+    #[arg(long)]
+    replace_partitions: bool,
+    /// Drop the <table>__old_<value> tables after a successful load
+    #[arg(long)]
+    drop_old: bool,
+    /// After the load: counts (always) | checksum (per-column, both engines) | except (checksum + differing row samples)
+    #[arg(long, default_value = "counts")]
+    verify: String,
+    /// Rows to show per differing table/partition with --verify except
+    #[arg(long, default_value_t = 10)]
+    sample: usize,
+    /// Read a table from Parquet instead of the DuckDB file: table=<glob> (repeatable; hive folders supported)
+    #[arg(long = "source-parquet")]
+    source_parquet: Vec<String>,
     /// Directory ON THE SQL SERVER HOST where the .bak is written
     #[arg(long, default_value = "/var/opt/mssql/backup")]
     backup_dir: String,
@@ -730,6 +773,36 @@ fn export_inner(a: ExportArgs, q: bool) -> Result<()> {
             if !loc.is_local() { log(q, format!("uploading to {loc} ...")); storage::upload(&local, &loc, &mut |_, _| {})?; }
             println!("wrote {} ({:.1} MB). Run with: sqlcmd -S host -U sa -i {}", loc, std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0) as f64 / 1e6, loc.file_name());
             print_warnings(&ws);
+        }
+        ExportKind::Server if a.into_existing => {
+            use duckbridge::mssql::jobs;
+            let em = Emitter::new(Flavor::Mssql, sm);
+            let target = a.conn.target("master");
+            let guard = Guard::new(Some(&a.disposable_db_pattern))?;
+            let mut parquet_sources = HashMap::new();
+            for s in &a.source_parquet { let (t, g) = s.split_once('=').ok_or_else(|| anyhow::anyhow!("--source-parquet expects table=glob, got {s:?}"))?; parquet_sources.insert(t.trim().to_string(), g.trim().to_string()); }
+            let mut splits = jobs::parse_splits(&a.splits)?;
+            for (t, g) in &parquet_sources { splits.entry(t.clone()).or_insert(jobs::SplitSpec::Files(g.clone())); }
+            let strategies = jobs::parse_strategies(&a.strategies)?;
+            let check_pk = match a.check_pk.as_deref().map(|s| s.to_lowercase()) { None => duckbridge::mssql::target::PkCheck::None, Some(ref s) if s == "hash" => duckbridge::mssql::target::PkCheck::Hash, Some(_) => duckbridge::mssql::target::PkCheck::Full };
+            let o = duckbridge::mssql::loadx::ExistingLoadOptions {
+                database: db_name.clone(), guard, parallel, max_jobs_per_table: a.max_jobs_per_table, batch_rows: a.batch_rows, splits, strategies,
+                default_strategy: jobs::Strategy::Serial, split_threshold: a.split_threshold, state_dir: a.state_dir.clone(), replace_partitions: a.replace_partitions, drop_old: a.drop_old,
+                ignore_extra_columns: a.ignore_extra_columns, preflight: duckbridge::mssql::target::PreflightOptions { check_pk, allow_rescale: a.allow_rescale, collation_check: true, samples: 5 },
+                check_only: a.check_only, verify: duckbridge::verify::VerifyLevel::parse(&a.verify)?.with_sample(a.sample), order_by_key: a.order_by_key, parquet_sources,
+            };
+            let rep = duckbridge::mssql::loadx::load_into_existing(&con, &cat, &target, &em, &o, progress.clone())?;
+            if a.plan {
+                let stmts = duckbridge::core::runlog::planned_statements();
+                println!("-- PLAN for [{db_name}] on {}:{} ({} statements/jobs; nothing was executed)", a.conn.host, a.conn.port, stmts.len());
+                for (i, s) in stmts.iter().enumerate() { println!("{:>4}  {s}", i + 1); }
+            } else if a.check_only {
+                println!("pre-flight passed for {} table(s): {}", rep.tables.len(), rep.tables.join(", "));
+            } else {
+                println!("loaded {} rows into {} existing table(s) in [{db_name}] in {:.1}s ({:.0} rows/s); {} job(s) done, {} skipped as already done", rep.rows, rep.tables.len(), rep.seconds, rep.rows as f64 / rep.seconds.max(0.001), rep.jobs_done, rep.jobs_skipped);
+                for v in &rep.verify { log(q, format!("  verify {v}")); }
+            }
+            print_warnings(&rep.warnings);
         }
         ExportKind::Server | ExportKind::Bak => {
             use duckbridge::mssql::load::*;

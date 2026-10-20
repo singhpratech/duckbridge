@@ -42,7 +42,9 @@ impl StringType {
     }
 }
 
-const BUCKETS: [usize; 7] = [50, 100, 255, 500, 1000, 2000, 4000];
+// No 4000 bucket: tiberius' INSERT BULK declares nvarchar(2001..4000) as nvarchar(max) and the load
+// fails, so anything above 2000 characters becomes NVARCHAR(MAX) / VARCHAR(MAX).
+const BUCKETS: [usize; 6] = [50, 100, 255, 500, 1000, 2000];
 
 fn bucket(n: usize) -> Option<usize> {
     BUCKETS.iter().copied().find(|b| n <= *b)

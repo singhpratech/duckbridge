@@ -42,6 +42,8 @@ const VECTOR_SIZE: usize = 2048;
 /// one (and worker threads borrow more through the core's connection provider), so nothing here
 /// touches the caller's own transaction.
 const POOL_SIZE: usize = 64;
+/// bulk_load uses a second pooled connection per worker, so parallel is capped at half the pool.
+const MAX_PARALLEL: usize = POOL_SIZE / 2;
 static POOL: Mutex<Vec<Connection>> = Mutex::new(Vec::new());
 
 struct Pool;
@@ -203,7 +205,7 @@ impl VTab for ExportVTab {
             tables: s_param(bind, "tables").map(|s| api::csv_list(&s)).unwrap_or_default(),
             exclude: s_param(bind, "exclude").map(|s| api::csv_list(&s)).unwrap_or_default(),
             schema_map: s_param(bind, "schema_map").unwrap_or_default(),
-            parallel: i_param(bind, "parallel", 0).max(0) as usize,
+            parallel: (i_param(bind, "parallel", 0).max(0) as usize).clamp(0, MAX_PARALLEL).max(if i_param(bind, "parallel", 0) == 0 { 0 } else { 1 }),
             drop_existing: b_param(bind, "drop_existing", false),
             schema_only: b_param(bind, "schema_only", false),
             target_version: i_param(bind, "target_version", 2019) as u16,
@@ -225,6 +227,20 @@ impl VTab for ExportVTab {
             log_file: s_param(bind, "log_file"),
             summary_file: s_param(bind, "summary_file"),
             progress_seconds: d.progress_seconds,
+            into_existing: b_param(bind, "into_existing", false),
+            ignore_extra_columns: b_param(bind, "ignore_extra_columns", false),
+            allow_rescale: b_param(bind, "allow_rescale", false),
+            check_only: b_param(bind, "check_only", false),
+            check_pk: s_param(bind, "check_pk").unwrap_or_default(),
+            splits: s_param(bind, "split").unwrap_or_default(),
+            strategies: s_param(bind, "strategy").unwrap_or_default(),
+            max_jobs_per_table: i_param(bind, "max_jobs_per_table", 0).max(0) as usize,
+            state_dir: s_param(bind, "state_dir"),
+            replace_partitions: b_param(bind, "replace_partitions", false),
+            drop_old: b_param(bind, "drop_old", false),
+            verify: s_param(bind, "verify").unwrap_or(d.verify),
+            sample: i_param(bind, "sample", d.sample as i64).max(0) as usize,
+            source_parquet: s_param(bind, "source_parquet").unwrap_or_default(),
         };
         let bd = api::BakRequest::default();
         let wants_bak = bind.get_named_parameter("bak").is_some() || b_param(bind, "verify_restore", false) || s_param(bind, "backup_to_url").is_some();
@@ -271,6 +287,9 @@ impl VTab for ExportVTab {
             ("split_threshold", bigint()), ("batch_rows", bigint()), ("create_database", boolean()),
             ("disposable_db_pattern", varchar()), ("compat_level", bigint()), ("recovery", varchar()),
             ("plan", boolean()), ("log_file", varchar()), ("summary_file", varchar()), ("string_type", varchar()), ("string_sizes", varchar()),
+            ("into_existing", boolean()), ("ignore_extra_columns", boolean()), ("allow_rescale", boolean()), ("check_only", boolean()), ("check_pk", varchar()),
+            ("split", varchar()), ("strategy", varchar()), ("max_jobs_per_table", bigint()), ("state_dir", varchar()), ("replace_partitions", boolean()), ("drop_old", boolean()),
+            ("verify", varchar()), ("sample", bigint()), ("source_parquet", varchar()),
             ("parquet_compression", varchar()),
             ("bak", varchar()), ("backup_dir", varchar()), ("fetch_via", varchar()), ("stripes", bigint()),
             ("compression", boolean()), ("verify_restore", boolean()), ("drop_staging", boolean()), ("backup_to_url", varchar()),

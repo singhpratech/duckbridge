@@ -3,15 +3,13 @@ use super::guard::Guard;
 use super::{exec_batch, MsClient, MssqlTarget};
 use crate::core::emit::{Emitter, Flavor};
 use crate::core::model::*;
-use crate::core::script::{date_from_days, naive_ts, select_sql, to_micros, trim_ns};
+use crate::core::script::select_sql;
 use crate::core::typemap::quote_duck;
 use super::split::ranges;
-use anyhow::{bail, Context, Result};
-use duckdb::types::ValueRef;
+use anyhow::{Context, Result};
 use duckdb::Connection;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use tiberius::{ColumnData, TokenRow};
 
 pub struct LoadOptions {
     pub database: String,
@@ -206,34 +204,14 @@ fn split_key(t: &Table) -> Option<String> {
 }
 
 async fn bulk_table(con: &Connection, client: &mut MsClient, t: &Table, sql: &str, em: &Emitter, batch_rows: usize, progress: &Arc<dyn Fn(&str, i64) + Send + Sync>) -> Result<i64> {
+    use super::bulk::{bulk_load, BulkOptions};
+    use super::convert::Converter;
     let tref = em.table_ref(&t.schema, &t.name);
-    let mut st = con.prepare(sql)?;
-    let mut rows = st.query([])?;
-    let mut n = 0i64;
-    let mut in_batch = 0usize;
-    let col_names: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
-    let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-    let opts = if t.has_identity() { tiberius::SqlBulkCopyOption::KeepIdentity | tiberius::SqlBulkCopyOption::TableLock } else { tiberius::SqlBulkCopyOptions::from(tiberius::SqlBulkCopyOption::TableLock) };
-    let mut req = client.bulk_insert_with_options(&tref, &col_refs, opts, &[]).await.with_context(|| format!("starting bulk insert into {tref}"))?;
-    while let Some(r) = rows.next()? {
-        let mut row = TokenRow::new();
-        for (i, c) in t.columns.iter().enumerate() {
-            row.push(to_column_data(r.get_ref_unwrap(i), c)?);
-        }
-        req.send(row).await?;
-        n += 1;
-        in_batch += 1;
-        if in_batch >= batch_rows {
-            // finalize + restart to bound server-side transaction size
-            req.finalize().await?;
-            req = client.bulk_insert_with_options(&tref, &col_refs, opts, &[]).await?;
-            in_batch = 0;
-            progress(&format!("{}.{}", t.schema, t.name), n);
-        }
-    }
-    req.finalize().await?;
-    progress(&format!("{}.{}", t.schema, t.name), n);
-    Ok(n)
+    let convs: Vec<Converter> = t.columns.iter().map(|c| Converter::for_sql_type(&c.sql_type, &c.duck_type).with_context(|| format!("{}.{}.{}", t.schema, t.name, c.name))).collect::<Result<_>>()?;
+    let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
+    let o = BulkOptions { batch_rows, keep_identity: t.has_identity(), table_lock: true, prefetch_batches: 4, order_by: None };
+    let tag = format!("{}.{}", t.schema, t.name);
+    bulk_load(con, client, &tref, &cols, &convs, sql, &o, &|n| progress(&tag, n)).await
 }
 
 async fn insert_table(con: &Connection, client: &mut MsClient, t: &Table, sql: &str, em: &Emitter, progress: &Arc<dyn Fn(&str, i64) + Send + Sync>) -> Result<i64> {
@@ -255,124 +233,4 @@ async fn insert_table(con: &Connection, client: &mut MsClient, t: &Table, sql: &
     if let Some(s) = em.identity_insert(t, false) { exec_batch(client, &s).await?; }
     progress(&format!("{}.{}", t.schema, t.name), n);
     Ok(n)
-}
-
-/// Convert a DuckDB value to the TDS column type that the target SQL type expects.
-pub fn to_column_data(v: ValueRef<'_>, col: &Column) -> Result<ColumnData<'static>> {
-    use ColumnData as C;
-    let ty = col.sql_type.to_uppercase();
-    let base = ty.split('(').next().unwrap_or("").to_string();
-    if matches!(v, ValueRef::Null) {
-        return Ok(match base.as_str() {
-            "BIT" => C::Bit(None), "TINYINT" => C::U8(None), "SMALLINT" => C::I16(None), "INT" => C::I32(None), "BIGINT" => C::I64(None),
-            "REAL" => C::F32(None), "FLOAT" => C::F64(None), "DECIMAL" | "NUMERIC" => C::Numeric(None),
-            "DATE" => C::Date(None), "TIME" => C::Time(None), "DATETIME2" => C::DateTime2(None), "DATETIMEOFFSET" => C::DateTimeOffset(None),
-            "UNIQUEIDENTIFIER" => C::Guid(None), "VARBINARY" | "BINARY" => C::Binary(None), _ => C::String(None),
-        });
-    }
-    let as_i128 = |v: &ValueRef| -> Option<i128> {
-        Some(match *v { ValueRef::TinyInt(x) => x as i128, ValueRef::SmallInt(x) => x as i128, ValueRef::Int(x) => x as i128, ValueRef::BigInt(x) => x as i128,
-            ValueRef::HugeInt(x) => x, ValueRef::UTinyInt(x) => x as i128, ValueRef::USmallInt(x) => x as i128, ValueRef::UInt(x) => x as i128, ValueRef::UBigInt(x) => x as i128,
-            ValueRef::Boolean(b) => b as i128, _ => return None })
-    };
-    let as_f64 = |v: &ValueRef| -> Option<f64> {
-        Some(match *v { ValueRef::Float(f) => f as f64, ValueRef::Double(f) => f, ValueRef::Decimal(d) => d.to_string().parse().ok()?, _ => as_i128(v)? as f64 })
-    };
-    let text = |v: &ValueRef| -> String {
-        match *v {
-            ValueRef::Text(b) => String::from_utf8_lossy(b).to_string(),
-            ValueRef::Timestamp(u, ts) => naive_ts(u, ts).format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
-            ValueRef::Date32(d) => date_from_days(d).to_string(),
-            ValueRef::Time64(u, t) => crate::core::script::time_from_units(u, t),
-            ValueRef::Interval { months, days, nanos } => format!("{months} months {days} days {} microseconds", nanos / 1000),
-            ValueRef::Blob(b) => hex::encode(b),
-            other => format!("{other:?}"),
-        }
-    };
-    Ok(match base.as_str() {
-        "BIT" => C::Bit(Some(match v { ValueRef::Boolean(b) => b, other => as_i128(&other).map(|x| x != 0).unwrap_or(false) })),
-        "TINYINT" => C::U8(Some(as_i128(&v).context("int")? as u8)),
-        "SMALLINT" => C::I16(Some(as_i128(&v).context("int")? as i16)),
-        "INT" => C::I32(Some(as_i128(&v).context("int")? as i32)),
-        "BIGINT" => C::I64(Some(as_i128(&v).context("int")? as i64)),
-        "REAL" => { let f = as_f64(&v).context("float")?; if f.is_finite() { C::F32(Some(f as f32)) } else { C::F32(None) } }
-        "FLOAT" => { let f = as_f64(&v).context("float")?; if f.is_finite() { C::F64(Some(f)) } else { C::F64(None) } }
-        "DECIMAL" | "NUMERIC" => {
-            let scale: u32 = ty.split(',').nth(1).and_then(|s| s.trim_end_matches(')').trim().parse().ok()).unwrap_or(0);
-            let d: rust_decimal::Decimal = match v {
-                ValueRef::Decimal(d) => d.to_string().parse().context("decimal")?,
-                ValueRef::Text(b) => String::from_utf8_lossy(b).parse().context("decimal text")?,
-                other => match as_i128(&other) { Some(i) => rust_decimal::Decimal::from_i128_with_scale(i, 0), None => rust_decimal::Decimal::from_f64_retain(as_f64(&other).context("decimal")?).context("decimal")? },
-            };
-            let mut d = d;
-            d.rescale(scale);
-            C::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(d.mantissa(), d.scale() as u8)))
-        }
-        "DATE" => match v {
-            ValueRef::Date32(d) => C::Date(Some(tiberius::time::Date::new(days_from_ce(date_from_days(d))))),
-            ValueRef::Timestamp(u, ts) => { let dt = naive_ts(u, ts); C::Date(Some(tiberius::time::Date::new(days_from_ce(dt.date())))) }
-            ValueRef::Text(b) => { let s = String::from_utf8_lossy(b); let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").with_context(|| format!("date {s}"))?; C::Date(Some(tiberius::time::Date::new(days_from_ce(d)))) }
-            _ => bail!("cannot convert {v:?} to DATE"),
-        },
-        "TIME" => match v {
-            ValueRef::Time64(u, t) => { let micros = to_micros(u, t); C::Time(Some(tiberius::time::Time::new((micros * 10) as u64, 7))) }
-            ValueRef::Text(b) => { let s = String::from_utf8_lossy(b); let t = parse_naive_time(&s)?; use chrono::Timelike; let ticks = t.num_seconds_from_midnight() as u64 * 10_000_000 + t.nanosecond() as u64 / 100; C::Time(Some(tiberius::time::Time::new(ticks, 7))) }
-            _ => bail!("cannot convert {v:?} to TIME"),
-        },
-        "DATETIME2" => match v {
-            ValueRef::Timestamp(u, ts) => { let dt = naive_ts(u, ts); C::DateTime2(Some(dt2(dt))) }
-            ValueRef::Date32(d) => C::DateTime2(Some(dt2(date_from_days(d).and_hms_opt(0, 0, 0).unwrap()))),
-            ValueRef::Text(b) => { let s = trim_ns(&String::from_utf8_lossy(b)); C::DateTime2(Some(dt2(parse_naive_ts(&s)?))) }
-            _ => bail!("cannot convert {v:?} to DATETIME2"),
-        },
-        "DATETIMEOFFSET" => match v {
-            ValueRef::Timestamp(u, ts) => { let dt = naive_ts(u, ts); C::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(dt2(dt), 0))) }
-            ValueRef::Text(b) => { let s = String::from_utf8_lossy(b); let (dt, off_min) = parse_ts_offset(&s)?; C::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(dt2(dt), off_min))) }
-            _ => bail!("cannot convert {v:?} to DATETIMEOFFSET"),
-        },
-        "UNIQUEIDENTIFIER" => match v { ValueRef::Text(b) => C::Guid(Some(uuid::Uuid::parse_str(&String::from_utf8_lossy(b)).context("uuid")?)), other => { let s = format!("{other:?}"); C::Guid(uuid::Uuid::parse_str(s.trim_matches(|c| c == '"' || c == '\'' )).ok()) } },
-        "VARBINARY" | "BINARY" => match v { ValueRef::Blob(b) => C::Binary(Some(b.to_vec().into())), ValueRef::Text(b) => C::Binary(Some(b.to_vec().into())), _ => bail!("cannot convert {v:?} to binary") },
-        _ => C::String(Some(text(&v).into())),
-    })
-}
-
-fn parse_naive_ts(s: &str) -> Result<chrono::NaiveDateTime> {
-    let s = s.trim();
-    for f in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"] {
-        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, f) { return Ok(d); }
-        if f == "%Y-%m-%d" { if let Ok(d) = chrono::NaiveDate::parse_from_str(s, f) { return Ok(d.and_hms_opt(0, 0, 0).unwrap()); } }
-    }
-    bail!("cannot parse timestamp {s:?}")
-}
-
-fn parse_naive_time(s: &str) -> Result<chrono::NaiveTime> {
-    let s = s.trim();
-    for f in ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"] {
-        if let Ok(t) = chrono::NaiveTime::parse_from_str(s, f) { return Ok(t); }
-    }
-    bail!("cannot parse time {s:?}")
-}
-
-/// "2024-01-01 10:00:00.123456+00:00" / "+00" / "Z" -> (local naive datetime, offset minutes)
-fn parse_ts_offset(s: &str) -> Result<(chrono::NaiveDateTime, i16)> {
-    let s = s.trim();
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) { return Ok((dt.naive_local(), (dt.offset().local_minus_utc() / 60) as i16)); }
-    for f in ["%Y-%m-%d %H:%M:%S%.f%:z", "%Y-%m-%d %H:%M:%S%.f %:z", "%Y-%m-%d %H:%M:%S%.f%#z", "%Y-%m-%d %H:%M:%S%:z", "%Y-%m-%d %H:%M:%S%#z"] {
-        if let Ok(dt) = chrono::DateTime::parse_from_str(s, f) { return Ok((dt.naive_local(), (dt.offset().local_minus_utc() / 60) as i16)); }
-    }
-    Ok((parse_naive_ts(s.trim_end_matches('Z'))?, 0))
-}
-
-fn days_from_ce(d: chrono::NaiveDate) -> u32 {
-    use chrono::Datelike;
-    (d.num_days_from_ce() - 1) as u32
-}
-
-fn dt2(dt: chrono::NaiveDateTime) -> tiberius::time::DateTime2 {
-    use chrono::Timelike;
-    let date = tiberius::time::Date::new(days_from_ce(dt.date()));
-    let secs = dt.num_seconds_from_midnight() as u64;
-    let nanos = dt.nanosecond() as u64;
-    let increments = secs * 10_000_000 + nanos / 100; // 100ns ticks, scale 7
-    tiberius::time::DateTime2::new(date, tiberius::time::Time::new(increments, 7))
 }

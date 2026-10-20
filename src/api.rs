@@ -107,7 +107,8 @@ pub fn parse_schema_map(spec: &str, default: &[(&str, &str)]) -> HashMap<String,
 
 pub fn csv_list(s: &str) -> Vec<String> { s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect() }
 
-fn cores(n: usize) -> usize { if n == 0 { num_cpus::get() } else { n } }
+/// 0 = number of cores. Capped at 32: inside the DuckDB extension every worker takes two pooled connections.
+fn cores(n: usize) -> usize { (if n == 0 { num_cpus::get() } else { n }).clamp(1, 32) }
 
 // ---------------------------------------------------------------- import
 
@@ -256,11 +257,32 @@ pub struct ExportRequest {
     /// Write a JSON summary (per table/job) to this file at the end.
     pub summary_file: Option<String>,
     pub progress_seconds: u64,
+    // ---- loads into existing production tables (spec R2, R4, R9) ----
+    pub into_existing: bool,
+    pub ignore_extra_columns: bool,
+    pub allow_rescale: bool,
+    pub check_only: bool,
+    /// "" | "full" | "hash"
+    pub check_pk: String,
+    /// "table=column:Mkt,other=hash:a,b:8" (';' also separates entries)
+    pub splits: String,
+    /// "table=switch;*=serial"
+    pub strategies: String,
+    pub max_jobs_per_table: usize,
+    pub state_dir: Option<String>,
+    pub replace_partitions: bool,
+    pub drop_old: bool,
+    /// "counts" | "checksum" | "except"
+    pub verify: String,
+    pub sample: usize,
+    /// "table=glob;..." Parquet sources
+    pub source_parquet: String,
 }
 
 impl Default for ExportRequest {
     fn default() -> Self {
-        ExportRequest { database: None, tables: vec![], exclude: vec![], schema_map: String::new(), parallel: 0, drop_existing: false, schema_only: false, target_version: 2019, string_mode: "fit".into(), string_type: "nvarchar".into(), string_sizes: "from-data".into(), method: "bulk".into(), pk_inline: false, order_by_key: false, split_threshold: 5_000_000, batch_rows: 100_000, create_database: false, parquet_compression: "zstd".into(), source_label: "duckdb".into(), disposable_db_pattern: None, compat_level: None, recovery: None, plan: false, log_file: None, summary_file: None, progress_seconds: 10 }
+        ExportRequest { database: None, tables: vec![], exclude: vec![], schema_map: String::new(), parallel: 0, drop_existing: false, schema_only: false, target_version: 2019, string_mode: "fit".into(), string_type: "nvarchar".into(), string_sizes: "from-data".into(), method: "bulk".into(), pk_inline: false, order_by_key: false, split_threshold: 5_000_000, batch_rows: 100_000, create_database: false, parquet_compression: "zstd".into(), source_label: "duckdb".into(), disposable_db_pattern: None, compat_level: None, recovery: None, plan: false, log_file: None, summary_file: None, progress_seconds: 10,
+            into_existing: false, ignore_extra_columns: false, allow_rescale: false, check_only: false, check_pk: String::new(), splits: String::new(), strategies: String::new(), max_jobs_per_table: 0, state_dir: None, replace_partitions: false, drop_old: false, verify: "counts".into(), sample: 10, source_parquet: String::new() }
     }
 }
 
@@ -308,6 +330,7 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
     let target = dsn.mssql_target(Some("master"));
     crate::core::runlog::init(r.log_file.as_deref().map(std::path::Path::new), r.summary_file.as_deref().map(std::path::Path::new), r.plan, r.progress_seconds);
     let guard = Guard::new(r.disposable_db_pattern.as_deref())?;
+    if r.into_existing { return export_into_existing(con, &cat, &target, &em, r, guard, &db_name); }
     // a .bak staging database is created by definition; a plain live load needs create_database
     let lo = LoadOptions { database: db_name.clone(), drop_existing: r.drop_existing, with_data: !r.schema_only, parallel: cores(r.parallel), batch_rows: r.batch_rows, method: if r.method.eq_ignore_ascii_case("insert") { LoadMethod::Insert } else { LoadMethod::Bulk }, guard: guard.clone(), create_database: r.create_database || bak.is_some(), recovery: r.recovery.clone(), compat_level: r.compat_level, pk_after_load: !r.pk_inline, split_threshold: r.split_threshold, order_by_key: r.order_by_key };
     let rt = mssql::runtime()?;
@@ -380,6 +403,37 @@ pub fn export_mssql(con: &Connection, dsn: &Dsn, r: &ExportRequest, bak: Option<
     }
     warnings.extend(cat.column_warnings());
     out.extend(warnings.iter().map(|w| Row::warn(w)));
+    crate::core::runlog::finish(true)?;
+    Ok(out)
+}
+
+fn specs(s: &str) -> Vec<String> { s.split(';').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect() }
+
+fn export_into_existing(con: &Connection, cat: &crate::core::model::Catalog, target: &MssqlTarget, em: &Emitter, r: &ExportRequest, guard: Guard, db_name: &str) -> Result<Vec<Row>> {
+    use crate::mssql::{jobs, loadx, target as tgt};
+    let mut parquet_sources = HashMap::new();
+    for s in specs(&r.source_parquet) { let (t, g) = s.split_once('=').ok_or_else(|| anyhow!("source_parquet expects table=glob, got {s:?}"))?; parquet_sources.insert(t.trim().to_string(), g.trim().to_string()); }
+    let mut splits = jobs::parse_splits(&specs(&r.splits))?;
+    for (t, g) in &parquet_sources { splits.entry(t.clone()).or_insert(jobs::SplitSpec::Files(g.clone())); }
+    let strategies = jobs::parse_strategies(&specs(&r.strategies))?;
+    let check_pk = match r.check_pk.to_lowercase().as_str() { "" | "none" => tgt::PkCheck::None, "hash" => tgt::PkCheck::Hash, _ => tgt::PkCheck::Full };
+    let o = loadx::ExistingLoadOptions {
+        database: db_name.to_string(), guard, parallel: cores(r.parallel), max_jobs_per_table: if r.max_jobs_per_table == 0 { None } else { Some(r.max_jobs_per_table) }, batch_rows: r.batch_rows, splits, strategies,
+        default_strategy: jobs::Strategy::Serial, split_threshold: r.split_threshold, state_dir: r.state_dir.as_ref().map(PathBuf::from), replace_partitions: r.replace_partitions, drop_old: r.drop_old,
+        ignore_extra_columns: r.ignore_extra_columns, preflight: tgt::PreflightOptions { check_pk, allow_rescale: r.allow_rescale, collation_check: true, samples: 5 },
+        check_only: r.check_only, verify: crate::verify::VerifyLevel::parse(&r.verify)?.with_sample(r.sample), order_by_key: r.order_by_key, parquet_sources,
+    };
+    let progress: Arc<dyn Fn(&str, i64) + Send + Sync> = Arc::new(|j, n| crate::core::runlog::progress(j, n));
+    let rep = loadx::load_into_existing(con, cat, target, em, &o, progress)?;
+    let mut out = vec![];
+    if r.plan {
+        out.extend(crate::core::runlog::planned_statements().into_iter().enumerate().map(|(i, s)| Row::new(format!("#{}", i + 1), "plan", 0, s)));
+    }
+    for t in &rep.tables { out.push(Row::new(t.clone(), "table", 0, if r.check_only { "pre-flight passed" } else { "loaded into existing table" })); }
+    for f in &rep.findings { out.push(Row::new(f.table.clone(), "finding", 0, f.to_string())); }
+    for v in &rep.verify { out.push(Row::new(v.table.clone(), if v.ok { "verify" } else { "verify-mismatch" }, 0, v.to_string())); }
+    out.push(Row::new(format!("[{db_name}]"), "summary", rep.rows, format!("{} table(s), {} job(s) done, {} skipped, {:.1}s ({:.0} rows/s)", rep.tables.len(), rep.jobs_done, rep.jobs_skipped, rep.seconds, rep.rows as f64 / rep.seconds.max(0.001))));
+    out.extend(rep.warnings.iter().map(|w| Row::warn(w)));
     crate::core::runlog::finish(true)?;
     Ok(out)
 }

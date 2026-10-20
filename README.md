@@ -23,9 +23,29 @@ One static binary (Linux, macOS, Windows). No ODBC driver, no Python, no `bcp` n
 | `export`    | Write a DuckDB file to SQL Server as a T-SQL **script**, a **live load** (TDS bulk copy), or a **`.bak`** (load → `BACKUP DATABASE` → fetch → verify by restore). Also `--to postgres` and `--to parquet`. |
 | `inspect`   | Show the catalog and the exact type mapping + loss warnings for every column before you commit. |
 | `cp`        | Copy a file between local disk and `s3://` / `az://` / `gs://` with the built-in clients. |
+| `swap`      | Cut over: rename live tables to `<live>__old_<timestamp>` and new tables to the live names, all or nothing (0.1.1). |
+| `drop-old`  | Drop the `__old_` tables left by `swap` that are older than a date (0.1.1). |
+| `audit-ci`  | Report values that differ only by case or trailing spaces, so you know whether case-insensitive handling is needed (0.1.1). |
+| `verify-math` | Evaluate random arithmetic cases on SQL Server and in DuckDB (with the `mssql_*` macros) and report mismatches (0.1.1). |
 
 Input files and outputs accept local paths or `s3://bucket/key`, `az://container/blob`, `gs://bucket/key`.
 Cloud clients are built in (SigV4 / Azure Shared Key or SAS), credentials come from the usual environment variables.
+
+## What changed in 0.1.1
+
+0.1.1 makes loads into shared production servers safe (see [Loading into production tables safely](#loading-into-production-tables-safely)).
+New features are new flags or subcommands; the behaviour changes below are on by default.
+
+| Before (0.1.0) | Now (0.1.1) |
+|---|---|
+| `--drop-existing` ran `SET SINGLE_USER WITH ROLLBACK IMMEDIATE` and disconnected other sessions | `ROLLBACK IMMEDIATE` is never issued. A drop stops with the list of connected sessions. |
+| A live load created the target database if it was missing | Needs `--create-database`, and the name must match the disposable pattern (default `^_`). |
+| Every live load set compatibility level 150 and `RECOVERY SIMPLE` | Never changed unless `--compat-level` / `--recovery` are given, and only on disposable databases. |
+| `run` / `transpile` set a global `nocase` collation | `--nocase rewrite` is the default (per-literal `lower()`/`rtrim`); `global` is opt-in because it is slow on big `GROUP BY` / `DISTINCT`. |
+| Import read with the server's default lock behaviour | `LOCK_TIMEOUT 1000` ms, `DEADLOCK_PRIORITY LOW`, a lock check before each table, a change fingerprint before and after (up to 2 re-reads). |
+| Strings above 4000 characters became `NVARCHAR(MAX)` | Above 2000 characters they become `NVARCHAR(MAX)` (the TDS bulk path cannot declare `nvarchar(2001..4000)`). |
+| Row values converted one by one from text | Precompiled column converters, DECIMAL passed as mantissa, pipelined read/convert/send. Conversion runs at about 1.2 M rows/s; one bulk session reaches about 650 k rows/s on the dev container (17-column rows, local SQL Server 2019), up from about 500 k. Your numbers depend on hardware and network. |
+| Exit code 1 for any error | 0 ok, 1 a check failed, 2 could not run, 3 stopped by the safety guard. |
 
 ## Quick start
 
@@ -77,6 +97,39 @@ No system Kerberos libraries are needed: Windows uses the OS SSPI, other platfor
 NTLM implementation. `--trust-cert` (default on) accepts self-signed server certificates; TLS is
 always on unless `--encrypt false`.
 
+### Reading from a busy source
+
+`import` protects the source server and the data it reads. Every import connection runs
+`SET LOCK_TIMEOUT 1000; SET DEADLOCK_PRIORITY LOW;` (DuckBridge loses deadlocks, production jobs win), and the
+source connection can only run reads. Before each table it checks for locks held by other sessions, and it
+compares a fingerprint (row count, `last_user_update`, `modify_date`) before and after the read; if the
+fingerprint changed, the table is read again.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--isolation read-committed\|read-uncommitted\|snapshot` | `read-committed` | `snapshot` needs `ALLOW_SNAPSHOT_ISOLATION` (with only `READ_COMMITTED_SNAPSHOT` on, statement-level versioning is used); otherwise the import stops. When the database has either option on, the import prints a hint to use it. `--nolock` is the same as `read-uncommitted`. |
+| `--lock-timeout <ms>` | `1000` | `SET LOCK_TIMEOUT` on every source connection (`-1` waits forever). |
+| `--lock-check <bool>` | `true` | Look for X / IX / SIX / Sch-M locks from other sessions on the table before reading it. |
+| `--lock-wait <s>` | `30` | How long to wait for those locks to clear. |
+| `--on-lock fail\|skip` | `fail` | After the wait: fail naming the blocking sessions, or skip the table and report it. |
+| `--max-rereads <n>` | `2` | Re-read a table whose fingerprint changed during the read; fail after n re-reads. |
+| `--manifest <file>` | none | Write what was read, as CSV plus a JSON copy (`x.csv` and `x.json`). |
+| `--readonly` | off | Connect with `ApplicationIntent=ReadOnly` (routes to a readable secondary when there is one). |
+| `--wait-for "<T-SQL>"` | none | Poll a query (first column true/1) before starting, for example an upstream job's completion flag. |
+| `--wait-timeout <s>` | `3600` | Give up on `--wait-for` after this long. |
+
+The manifest has one row per table with the columns `table, rows_read, rows_source_stats, fingerprint_before,
+fingerprint_after, started, finished, seconds, isolation, rereads`. A skipped table has `rows_read = -1`.
+Downstream jobs can read it to confirm what they were given.
+
+```bash
+duckbridge import work.duckdb --host SRC --database SRCDB --tables t1,t2 \
+    --isolation snapshot --lock-timeout 1000 --on-lock fail --manifest in.manifest.csv -j 8 \
+    --wait-for "SELECT CAST(CASE WHEN EXISTS(SELECT 1 FROM ctl.flags WHERE step='inputs' AND done=1) THEN 1 ELSE 0 END AS bit)"
+```
+
+`import` also accepts `--log <file>` and `--summary <file>` (see [Plan, log, summary](#plan-log-summary)).
+
 ### Making DuckDB behave like SQL Server
 
 `run` (and `transpile --from tsql`, unless `--no-prelude`) applies a session prelude before your T-SQL:
@@ -88,8 +141,9 @@ SET TimeZone = 'UTC';
 SET default_collation = 'nocase';                              -- SQL Server default collations are case-insensitive
 ```
 
-Under `nocase`, T-SQL `LIKE` becomes DuckDB `ILIKE` (DuckDB `LIKE` is case-sensitive). Use `--nocase false` for a
-binary-collated source. When translating DuckDB SQL **to** T-SQL, `a / b` becomes `CAST(a AS FLOAT) / b` because DuckDB
+Since 0.1.1 the `default_collation` line is only emitted with `--nocase global`; the default prelude (`--nocase rewrite`)
+is the first three statements, and case-insensitivity is handled per comparison (see [Case-insensitive strings](#case-insensitive-strings)).
+T-SQL `LIKE` becomes DuckDB `ILIKE` (DuckDB `LIKE` is case-sensitive). Use `--nocase off` for a binary-collated source. When translating DuckDB SQL **to** T-SQL, `a / b` becomes `CAST(a AS FLOAT) / b` because DuckDB
 `/` is always floating point, and `//` becomes `/`.
 
 ### Target version
@@ -139,7 +193,7 @@ Every lossy decision is reported per column by `inspect` and at the end of every
 | HUGEINT / UHUGEINT / VARINT | DECIMAL(38,0), or NVARCHAR text when any value exceeds 38 digits | measured, never truncated |
 | FLOAT / DOUBLE | REAL / FLOAT(53) | NaN and ±Infinity become NULL (SQL Server cannot store them) |
 | DECIMAL(p,s) | DECIMAL(p,s) | |
-| VARCHAR | NVARCHAR(n) sized from data, or NVARCHAR(MAX) (`--string-mode max`) | key columns capped at NVARCHAR(450) |
+| VARCHAR | NVARCHAR(n) sized from data, or NVARCHAR(MAX) (`--string-mode max`) | key columns capped at NVARCHAR(450); above 2000 characters NVARCHAR(MAX); `--string-type varchar\|auto` in [create mode](#string-types-in-create-mode) |
 | BLOB | VARBINARY(MAX) | |
 | DATE / TIME | DATE / TIME(7) | |
 | TIMESTAMP (_S/_MS/_NS) | DATETIME2(7) | TIMESTAMP_NS loses digits 8–9 |
@@ -168,6 +222,233 @@ covers `LIMIT`/`OFFSET`, `::` casts, `||`, interval arithmetic → `DATEADD`, `s
 temp tables, `RETURNING` → `OUTPUT`, and so on. Anything that cannot be translated faithfully (procedural `IF`/`WHILE`,
 cursors, regex on 2019, `QUALIFY`, nested types…) is left in place or commented out **and reported as a warning**, never
 silently changed.
+### Warnings and `--strict`
+
+Constructs that DuckDB cannot reproduce exactly are reported with a code, line and column, for example
+`W-DIV-DECIMAL (line 12:8): ...`. Free-text warnings from older rules carry `W-GENERIC`.
+
+| Code | Meaning |
+|---|---|
+| `W-DIV-DECIMAL` | T-SQL `numeric / numeric` yields a truncated `numeric(p,s)`; DuckDB yields `DOUBLE`, so the last digits can differ. |
+| `W-ROUND-TRUNC` | `ROUND(x, n, 1)` (truncate) is done with `DOUBLE` arithmetic. |
+| `W-FORMAT-NUM` | `FORMAT(x, '0.0%')` and other numeric formats are not translated. |
+| `W-TRYCAST-EMPTY` | `TRY_CAST('' AS int)` is `0` in T-SQL and `NULL` in DuckDB. |
+| `W-CI-COMPARE` | A string comparison, `GROUP BY` or `DISTINCT` that depends on a case-insensitive collation and was not rewritten. |
+| `W-TRAILING-SPACE` | `'a' = 'a '` is true in T-SQL and false in DuckDB. |
+| `W-PROCEDURAL` | `WHILE`, `IF ... BEGIN ... END`, dynamic SQL: left as a comment, so the statement is not executed. |
+| `W-POWER-DOUBLE` | `power()` / `**` use `DOUBLE`; decimal formulas can differ in the last digit. |
+
+`--strict` (on `transpile` and `run`) turns any warning into an error: nothing is executed and the exit code is 1.
+
+```bash
+duckbridge run work.duckdb steps/nightly.sql --strict --nocase rewrite --mssql-math
+```
+
+### Case-insensitive strings
+
+`--nocase rewrite|global|off` (default `rewrite`):
+
+| Mode | What it does |
+|---|---|
+| `rewrite` | `LIKE` becomes `ILIKE`. A comparison of a column with a letter-containing literal becomes `lower(rtrim(col, ' ')) = lower('Lit')` (also `<>` and `IN (...)`). Joins, `GROUP BY`, `DISTINCT` and ordering comparisons are not rewritten and get `W-CI-COMPARE`. |
+| `global` | `SET default_collation = 'nocase'`. Everything is case-insensitive, but on large inputs it makes hash `GROUP BY` / `DISTINCT` single-threaded and can run out of memory where the binary collation finishes in minutes. |
+| `off` | Binary comparisons, like a `_BIN` / `_CS` source. |
+
+To see whether you need any of this, run the audit. If a column has no values that differ only by case or trailing
+spaces, binary comparison gives the same result as SQL Server's `CI_AS` for that data:
+
+```bash
+duckbridge audit-ci work.duckdb --tables customers,orders --columns name,country --script nightly.sql
+```
+
+It lists, per column, the values that collide by case or trailing space, and every string literal in the script that
+matches a column value only case-insensitively (rewrite the literal). `--json` gives machine-readable output.
+
+### Exact SQL Server arithmetic
+
+`--mssql-math` installs DuckDB macros that reproduce SQL Server results with integer/HUGEINT arithmetic instead of
+`DOUBLE`, and the translator uses them where it knows the column types:
+
+| Macro | T-SQL it stands for |
+|---|---|
+| `mssql_div(a, b, p, s)` | `numeric` division, truncated to the result scale |
+| `mssql_round(x, n)` | `ROUND(x, n)`, half away from zero on DECIMAL |
+| `mssql_round_trunc(x, n)` | `ROUND(x, n, 1)` |
+| `mssql_try_int(text)` | `TRY_CAST(text AS int)`, with `''` giving `0` |
+| `mssql_format_pct(x, decimals)` | `FORMAT(x, '0.0%')` |
+
+Types come from `CREATE TABLE` / `DECLARE` in the same script, or from `--types`:
+
+```bash
+duckbridge transpile kpi.sql --mssql-math --types 'amount=decimal(18,4),qty=int' -o kpi.duckdb.sql
+duckbridge verify-math --host sql01 --user sa --cases 20000      # random cases on both engines, reports mismatches
+```
+
+## Loading into production tables safely
+
+For a weekly batch into a shared SQL Server with fixed production DDL, use `export --to server` with the options
+below. The tool only touches objects it is allowed to, loads into the DDL you already have, checks the data
+before it moves, and can resume after a kill.
+
+### Safety guard
+
+Database-level statements (`CREATE`/`DROP DATABASE`, `ALTER DATABASE ... SET RECOVERY`, `SET COMPATIBILITY_LEVEL`) are
+allowed only for databases whose name matches the **disposable-database pattern**: `--disposable-db-pattern <regex>`,
+env `DUCKBRIDGE_DISPOSABLE_DB_PATTERN`, default `^_` (names starting with an underscore).
+
+| Situation | Result |
+|---|---|
+| `--drop-existing` on `Sales` (not disposable) | refused before connecting: `refusing DROP DATABASE on 'Sales': not a disposable database (pattern ^_)` |
+| Dropping `_scratch` while other sessions are connected | refused, the sessions are listed (id, login, host, program); nobody is disconnected |
+| Create, drop or alter any other database | refused |
+| `ROLLBACK IMMEDIATE` | never issued, no override flag exists |
+| Compatibility level, recovery model of an existing database | untouched. Set only with `--compat-level <n>` / `--recovery simple\|full\|bulk_logged`, on disposable databases |
+| Live load into a database that does not exist | error, unless `--create-database` is given and the name matches the pattern |
+
+Exit codes: `0` ok, `1` a check failed (types, lengths, PK, row counts, fingerprints), `2` could not run (connection,
+permissions), `3` stopped by the guard.
+
+### `--into-existing`
+
+`export --to server --into-existing` treats the target table's DDL as the contract. No `CREATE`, `ALTER` or `DROP`
+touches the target table (its `modify_date` does not change). The tool reads the target's columns, indexes, partitioning and check
+constraints from the catalog and maps DuckDB columns to them **by name**, case-insensitively, in the target's column order.
+
+* A DuckDB column with no target column is an error, unless `--ignore-extra-columns`.
+* A target column with no DuckDB column is an error, unless it is nullable or has a default; it is then left out of the load.
+* All checks run before any bulk session opens: one aggregate DuckDB query per table. Findings are reported together,
+  with the longest value and sample keys. `--check-only` runs them and moves no data.
+
+| Code | What is checked |
+|---|---|
+| `LENGTH` | `char`/`varchar(n)` (bytes for `_UTF8` collations), `nchar`/`nvarchar(n)` (UTF-16 code units), `binary`/`varbinary(n)` |
+| `CODEPAGE` | every character is representable in the column's code page (no silent `?`) |
+| `NOT_NULL` | NULLs in a `NOT NULL` target column |
+| `RANGE` | `tinyint` 0..255, `smallint`, `int`, `bigint`, `money`, `real`; NaN/Infinity |
+| `SCALE` / `PRECISION` | `decimal(p,s)`: source scale above `s` is an error unless `--allow-rescale`; values must fit `p-s` integer digits |
+| `BIT` | boolean, or integer in {0,1} |
+| `DATE_RANGE` | `date`, `datetime` (1753..9999), `smalldatetime`, `datetime2`; precision loss is a warning (`DATETIME_PRECISION`) |
+| `PK_DUP` | duplicate primary keys, trailing spaces ignored. Only with `--check-pk full\|hash` |
+| `CI_COLLISION` | keys that collide under a `_CI` collation (`'a'` vs `'A'`, or trailing spaces), which SQL Server would reject |
+
+`TYPE` (incompatible pair, bad UUID or number text) and `EXTRA_COLUMN` / `MISSING_COLUMN` also appear.
+
+```bash
+duckbridge export work.duckdb --to server --host TGT --database _stage_db --into-existing \
+    --check-only --check-pk hash
+```
+
+### Splitting and strategies
+
+A table is cut into jobs with `--split <table>=<spec>` (repeatable) and loaded with a strategy given by
+`--strategy <table|*>=<strategy>` (repeatable). All jobs of all tables share one queue, largest first, run by `-j N` bulk sessions.
+
+| `--split` spec | One job per |
+|---|---|
+| `column:<col>` | distinct value of a low-cardinality column (for example the market column) |
+| `files:<glob>` | Parquet file or Hive folder, e.g. `files:out/big/Mkt=*/` (no huge DuckDB table needed) |
+| `hash:<cols>:<n>` | `hash(cols) % n`, for tables without a natural split column |
+| `range:<col>:<n>` | integer key range (the 0.1.0 behaviour; also the automatic split above `--split-threshold`) |
+
+| `--strategy` | Use when | What happens |
+|---|---|---|
+| `switch` | The target is partitioned on the split column | Per job: create `<table>__stg_<value>` from the target's own metadata (same columns, collation, clustered key, compression, filegroup, a `CHECK` on the partition value), bulk load it with `TABLOCK`, build the nonclustered indexes, check the row count, then `ALTER TABLE ... SWITCH` it in. Readers never see a partial partition. |
+| `heap-then-index` | The target is a heap, or dropping and recreating its indexes is acceptable | The nonclustered and clustered indexes are captured from `sys.indexes`, dropped, the table is bulk loaded in parallel (`TABLOCK` bulk-update locks are compatible), and the indexes are recreated from the captured DDL (compression, fill factor, `INCLUDE`, filters). Captured DDL is written to the run log in case a run dies in between. |
+| `serial` | Small tables (default) | One bulk session per table. Many tables still load in parallel with each other. |
+
+On Standard Edition `CREATE INDEX` is single-threaded, so `heap-then-index` builds indexes one at a time;
+`switch` builds each partition's clustered index in its own session and is the only way to get parallel index builds there.
+
+```bash
+duckbridge export work.duckdb --to server --host TGT --database _stage_db --into-existing \
+    --split big_table=column:Mkt --strategy big_table=switch --strategy '*'=serial -j 8 \
+    --max-jobs-per-table 6 --state-dir state/ --replace-partitions --drop-old
+duckbridge export work.duckdb --to server --host TGT --database _stage_db --into-existing \
+    --source-parquet 'big_table=out/big_table/Mkt=*/' --split 'big_table=files:out/big_table/Mkt=*/' --strategy big_table=switch
+```
+
+| Flag | Meaning |
+|---|---|
+| `--max-jobs-per-table <n>` | one table cannot take every `-j` slot |
+| `--state-dir <dir>` | each finished job writes `<dir>/<schema>.<table>/<job>.done` (rows, seconds). Rerun with the same directory after a kill: finished jobs are skipped, an unfinished job's staging table (never visible to readers) is dropped and reloaded. A job killed after its `SWITCH` but before its marker fails on rerun with "partition N already holds X rows; pass --replace-partitions" rather than duplicating data. |
+| `--replace-partitions` | switch: a non-empty target partition is switched out to `<table>__old_<value>` instead of failing |
+| `--drop-old` | drop those `<table>__old_<value>` tables after a successful load |
+| `--source-parquet table=<glob>` | read that table from Parquet (Hive folders supported) instead of the DuckDB file |
+
+Staging tables are dropped only if their name contains `__stg_` or `__old_`; the target table is never dropped.
+
+### Verification
+
+`--verify counts|checksum|except` (default `counts`, which always runs), `--sample <n>` (default 10).
+
+| Level | Checks |
+|---|---|
+| `counts` | target rows (per partition for partitioned tables) against the DuckDB count |
+| `checksum` | per column, the sum of MD5 hashes of a canonical text form (`rtrim` for `char`, decimals at the target scale, ISO dates, lower-case GUIDs, hex binary, NULL marker), computed with the same rules in DuckDB and in SQL Server. A mismatch names the columns. Float columns are compared by NULL pattern only. Needs SQL Server 2019+. |
+| `except` | `checksum`, plus up to `--sample` differing rows in each direction for each table or partition that mismatches |
+
+After `heap-then-index` or `switch`, every index captured before the load must exist with the same definition
+(type, key columns and order, `INCLUDE`, filter, compression, fill factor, data space), and the PK must not be disabled.
+
+### Plan, log, summary
+
+* `--plan` prints every statement that would be sent to each server and the list of bulk jobs with estimated rows, and executes
+  nothing. It connects only for metadata reads.
+* `--log <file>` appends one line per statement and event; a failed log write never stops the run.
+* `--summary <file>` writes JSON: per table and job, rows, seconds, strategy and checks.
+* `--progress-seconds <n>` (default 10) sets the progress line interval (rows/s per job and in total).
+
+`import` accepts `--log` and `--summary` too.
+
+### Cut-over
+
+```bash
+duckbridge swap --host TGT --database PRODDB --pairs kpi_new=kpi,dim_new=dbo.dim --lock-timeout 5000
+duckbridge drop-old --host TGT --database PRODDB --before 2026-11-01
+```
+
+`swap` renames in one transaction with `SET LOCK_TIMEOUT` (default 5000 ms): each live table becomes
+`<live>__old_<yyyymmddhhmm>` (UTC) and each new table takes the live name. If a lock cannot be obtained, everything rolls
+back and the blocking sessions are listed; nobody is killed. It refuses, before changing anything, when a schema-bound view
+or function references the tables, when other tables have foreign keys to them, or when a name collides.
+The old tables are kept (`--keep-old` is on by default; `--keep-old false` drops them after the commit). `drop-old --before`
+removes `__old_` tables whose timestamp is earlier than the date (`YYYY-MM-DD` or `"YYYY-MM-DD HH:MM"`, UTC); `--schema` limits it.
+
+### String types in create mode
+
+Without `--into-existing`, DuckDB `VARCHAR` columns are created as `NVARCHAR` by default.
+
+| Flag | Values |
+|---|---|
+| `--string-type` | `nvarchar` (default), `varchar`, `auto` (`varchar` when every value of the column is ASCII, `nvarchar` otherwise; the decision shows in `inspect`) |
+| `--string-sizes` | `from-data` (default, measured), `max`, or a CSV file `table,column,type` that pins exact types |
+
+`inspect` takes the same two flags, so you can preview the DDL. Explicit `varchar` with non-ASCII data can lose characters in the
+target code page; use `auto`, or `--into-existing`, whose `CODEPAGE` check stops instead.
+
+### End to end
+
+```bash
+# 1. read the inputs safely
+duckbridge import work.duckdb --host SRC --database SRCDB --tables t1,t2 \
+    --isolation snapshot --lock-timeout 1000 --lock-check true --on-lock fail \
+    --manifest in.manifest.csv -j 8
+
+# 2. process; stop before running anything if a construct cannot be translated exactly
+duckbridge run work.duckdb steps/nightly.sql --strict --nocase rewrite --mssql-math
+
+# 3. pre-flight against the existing target DDL (no data moves)
+duckbridge export work.duckdb --to server --host TGT --database _stage_db --into-existing \
+    --check-only --check-pk hash
+
+# 4. load and verify
+duckbridge export work.duckdb --to server --host TGT --database _stage_db --into-existing \
+    --split big_table=column:Mkt --strategy big_table=switch --strategy '*'=serial -j 8 \
+    --state-dir state/ --verify checksum --log load.log --summary load.json
+
+# 5. cut over (optional)
+duckbridge swap --host TGT --database PRODDB --pairs kpi_new=kpi
+```
 
 ## Roadmap
 
@@ -186,6 +467,7 @@ done; the plan for the rest, in priority order:
 | 3 | Oracle | `SQL*Loader`-style direct path over OCI-free wire protocol, PL/SQL-lite rules | planned |
 | 3 | Snowflake / BigQuery / Databricks | Parquet stage + `COPY INTO`, dialect rules | planned |
 | 3 | SQLite | direct file read, dialect rules | planned |
+| 1 | Safe large loads into existing DDL, partition `SWITCH`, safe reads, verification, cut-over | done in 0.1.1 |
 | 4 | Change-data pipelines | incremental import by watermark / CDC tables, partitioned `.bak` shipping | planned |
 | 4 | Procedural T-SQL | IF / WHILE / cursors to a DuckDB job runner | research |
 
@@ -235,7 +517,22 @@ and any `warning`s. Named parameters mirror the CLI flags (`tables`, `exclude`, 
 `parallel`, `split_threshold`, `batch_rows`, `drop_existing`, `schema_only`, `overwrite`, `target_version`,
 `string_mode`, `method`, `pk_inline`, `order_by_key`, `bak`, `backup_dir`, `fetch_via`, `stripes`,
 `compression`, `verify_restore`, `drop_staging`, `backup_to_url`, `create_database`,
-`parquet_compression`; `bridge_run` takes `from`, `nocase`, `schema_map`, `continue_on_error`).
+`parquet_compression`; `bridge_run` takes `from`, `nocase`, `schema_map`, `continue_on_error`). The 0.1.1 parameters:
+
+| Function | New named parameters (same meaning as the CLI flag) |
+|---|---|
+| `bridge_import` | `isolation`, `lock_timeout`, `lock_check`, `lock_wait`, `on_lock`, `max_rereads`, `manifest`, `readonly`, `wait_for`, `wait_timeout`, `log_file`, `summary_file` |
+| `bridge_export` | `disposable_db_pattern`, `compat_level`, `recovery`, `plan`, `log_file`, `summary_file`, `string_type`, `string_sizes`, `into_existing`, `ignore_extra_columns`, `allow_rescale`, `check_only`, `check_pk`, `split`, `strategy`, `max_jobs_per_table`, `state_dir`, `replace_partitions`, `drop_old`, `verify`, `sample`, `source_parquet` |
+| `bridge_run` | `nocase_mode` (`rewrite`, `global`, `off`), `strict`, `mssql_math`, `types` |
+
+`split`, `strategy` and `source_parquet` take the CLI form, for example `split := 'big_table=column:Mkt'`; several entries are comma-separated.
+`bridge_prelude(true)` now returns the 3-line rewrite-mode prelude (no `default_collation`).
+
+```sql
+SELECT * FROM bridge_export('mssql://sa:p%40ss@tgt/_stage_db', into_existing := true, check_only := true, check_pk := 'hash');
+SELECT * FROM bridge_export('mssql://sa:p%40ss@tgt/_stage_db', into_existing := true,
+                            split := 'big_table=column:Mkt', strategy := 'big_table=switch', state_dir := 'state/', verify := 'checksum');
+```
 URL-encode special characters in passwords (`!` → `%21`, `#` → `%23`, `@` → `%40`).
 
 Build and test:
@@ -247,7 +544,7 @@ make test                           # scripts/e2e_extension.sh against the local
 
 How it works: the extension opens a pool of 64 connections to the host database when loaded
 and runs every operation on those, so parallel workers get their own connections and nothing
-touches your transaction. Two consequences worth knowing: `parallel` is capped at 64, and the
+touches your transaction. Two consequences worth knowing: `parallel` is capped at 32 (each bulk-load worker uses two pooled connections), and the
 database stays open until the process exits, so a `.wal` file may remain next to the database
 after a session that used the bridge (DuckDB replays it on the next open; the bridge checkpoints
 after each operation to keep it small). The extension is built on DuckDB's C extension API via
