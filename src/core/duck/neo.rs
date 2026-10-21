@@ -13,6 +13,12 @@
 //! * duckdb-neo has no table appender: [`Appender`] buffers rows, writes them into data chunks of a
 //!   column data collection, and inserts the collection with one `INSERT ... SELECT` per flush.
 //! * Errors carry DuckDB's message only (duckdb-neo appends ` (code N)`, dropped here), as v1.
+//!
+//! Also used by the DuckDB 2.0 extension (same duckdb-neo crate, `build-extension`), which has no
+//! connection and works on the chunks DuckDB lends its callbacks: [`Kind`] / [`Kind::of_type`] /
+//! [`write_column`] fill a table function's output chunk from `Value` rows ([`ChunkMut`] covers owned
+//! and borrowed chunks), [`import_arrow`] turns a COPY input exported with duckdb-neo's
+//! `ArrowExporter` into Arrow record batches.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -28,7 +34,13 @@ use neo::instance::{AttachBuilder, Instance};
 use neo::logical_type::LogicalType;
 use neo::query_result::ArrowQueryResult;
 use neo::statement::PreparedStatement;
-use neo::types::{BlobValue, DateValue, IntervalValue, TimeNsValue, TimeValue, TimestampMsValue, TimestampNsValue, TimestampSecValue, TimestampValue};
+use neo::data_chunk::DataChunkRef;
+use neo::logical_type::LogicalTypeID;
+use neo::types::{
+    BlobValue, DateValue, DecimalSignature, HugeDecimal, IntervalValue, LongDecimal, ShortDecimal, TimeNsValue, TimeValue, TimestampMsValue, TimestampNsValue,
+    TimestampSecValue, TimestampTzValue, TimestampValue, UuidValueRaw, WordDecimal,
+};
+use neo::vector::{Vector, VectorElement};
 use neo::{DuckDBType, Parameters, QueryParameter};
 
 /// The Arrow crate the backend speaks (results come in through the Arrow C data interface).
@@ -828,9 +840,19 @@ impl Drop for Appender<'_> {
     fn drop(&mut self) { let _ = self.flush(); }
 }
 
-/// The column-data type of one appended column.
+/// The vector type of one column written from `Value`s (an appended column, or a table function's
+/// output column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind { Bool, I8, I16, I32, I64, I128, U8, U16, U32, U64, U128, F32, F64, Text, Blob, Date, TimeUs, TimeNs, TsS, TsMs, TsUs, TsNs, Interval }
+pub enum Kind {
+    Bool, I8, I16, I32, I64, I128, U8, U16, U32, U64, U128, F32, F64, Text, Blob, Date, TimeUs, TimeNs, TsS, TsMs, TsUs, TsNs, Interval,
+    /// DECIMAL(width, scale); takes `Decimal`, its text (`"12.50"`, `"-3."`), integers and doubles
+    /// (rounded half away from zero to `scale` digits).
+    Decimal { width: u8, scale: u8 },
+    /// UUID; takes the text form or the 16 bytes (big-endian).
+    Uuid,
+    /// TIMESTAMP WITH TIME ZONE; takes the UTC instant as a `Timestamp`.
+    TsTz,
+}
 
 fn kind_of(v: &Value) -> Option<Kind> {
     Some(match v {
@@ -877,6 +899,41 @@ fn column_kind(rows: &[Vec<Value>], c: usize) -> Kind {
 }
 
 impl Kind {
+    /// The kind that writes vectors of `t` (a declared output column type); `None` for types it
+    /// cannot write (nested types, ENUM, ...).
+    pub fn of_type(t: &LogicalType) -> Option<Kind> {
+        use LogicalTypeID as T;
+        Some(match t.id().ok()? {
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN => Kind::Bool,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TINYINT => Kind::I8,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_SMALLINT => Kind::I16,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER => Kind::I32,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_BIGINT => Kind::I64,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_HUGEINT => Kind::I128,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_UTINYINT => Kind::U8,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_USMALLINT => Kind::U16,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_UINTEGER => Kind::U32,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_UBIGINT => Kind::U64,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_UHUGEINT => Kind::U128,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_FLOAT => Kind::F32,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_DOUBLE => Kind::F64,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR => Kind::Text,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_BLOB => Kind::Blob,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_DATE => Kind::Date,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TIME => Kind::TimeUs,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TIME_NS => Kind::TimeNs,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_SEC => Kind::TsS,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_MS => Kind::TsMs,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP => Kind::TsUs,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_NS => Kind::TsNs,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP_TZ => Kind::TsTz,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_INTERVAL => Kind::Interval,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_UUID => Kind::Uuid,
+            T::DUCKDB_V2_LOGICAL_TYPE_ID_DECIMAL => { let d = DecimalSignature::from_logical_type(t).ok()?; Kind::Decimal { width: d.width, scale: d.scale } }
+            _ => return None,
+        })
+    }
+
     fn logical_type(self, con: &neo::connection::Connection) -> Result<LogicalType> {
         match self {
             Kind::Bool => bool::logical_type(con),
@@ -902,6 +959,9 @@ impl Kind {
             Kind::TsUs => TimestampValue::logical_type(con),
             Kind::TsNs => TimestampNsValue::logical_type(con),
             Kind::Interval => IntervalValue::logical_type(con),
+            Kind::Decimal { width, scale } => DecimalSignature { width, scale }.logical_type(con),
+            Kind::Uuid => UuidValueRaw::logical_type(con),
+            Kind::TsTz => TimestampTzValue::logical_type(con),
         }
         .d()
     }
@@ -936,18 +996,79 @@ fn value_text(v: &Value) -> Option<String> {
     })
 }
 
-/// Write column `c` of `rows` into `chunk` as `kind`.
-fn write_column(chunk: &mut DataChunk<'_>, c: usize, kind: Kind, rows: &[Vec<Value>]) -> Result<()> {
+/// A data chunk whose vectors can be written: an owned [`DataChunk`] or one DuckDB lends a
+/// callback ([`DataChunkRef`], e.g. a table function's output).
+pub trait ChunkMut {
+    /// Vector `c` as `T`, borrowed mutably.
+    fn vector_mut<T: VectorElement>(&mut self, c: usize) -> neo::Result<Vector<'_, T>>;
+}
+impl ChunkMut for DataChunk<'_> {
+    fn vector_mut<T: VectorElement>(&mut self, c: usize) -> neo::Result<Vector<'_, T>> { self.get_vector_at_mut::<T>(c) }
+}
+impl ChunkMut for DataChunkRef<'_> {
+    fn vector_mut<T: VectorElement>(&mut self, c: usize) -> neo::Result<Vector<'_, T>> { self.get_vector_at_mut::<T>(c) }
+}
+
+/// `v` as the mantissa of a DECIMAL(_, scale): exact for `Decimal`s, their text and integers, rounded
+/// half away from zero for doubles and longer fractions.
+fn decimal_mantissa(v: &Value, scale: u8) -> Option<i128> {
+    let p = 10i128.checked_pow(scale as u32)?;
+    let rescale = |m: i128, s: u8| -> Option<i128> {
+        if s <= scale { m.checked_mul(10i128.checked_pow((scale - s) as u32)?) } else {
+            let d = 10i128.checked_pow((s - scale) as u32)?;
+            let (q, r) = (m / d, m % d);
+            Some(if r.abs() * 2 >= d { q + m.signum() } else { q })
+        }
+    };
+    match v {
+        Value::Decimal(d) => rescale(d.value(), d.scale()),
+        Value::Text(t) => {
+            let t = t.trim();
+            let (neg, digits) = match t.strip_prefix('-') { Some(r) => (true, r), None => (false, t.strip_prefix('+').unwrap_or(t)) };
+            let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+            if int.is_empty() && frac.is_empty() || !int.chars().chain(frac.chars()).all(|c| c.is_ascii_digit()) { return None; }
+            let all = format!("{int}{frac}");
+            let all = all.trim_start_matches('0');
+            let m: i128 = if all.is_empty() { 0 } else { all.parse().ok()? };
+            let m = rescale(m, u8::try_from(frac.len()).ok()?)?;
+            Some(if neg { -m } else { m })
+        }
+        Value::Double(f) => { let x = (f * p as f64).round(); (x.is_finite() && x.abs() < 1e38).then_some(x as i128) }
+        Value::Float(f) => { let x = (*f as f64 * p as f64).round(); (x.is_finite() && x.abs() < 1e38).then_some(x as i128) }
+        Value::TinyInt(x) => (*x as i128).checked_mul(p),
+        Value::SmallInt(x) => (*x as i128).checked_mul(p),
+        Value::Int(x) => (*x as i128).checked_mul(p),
+        Value::BigInt(x) => (*x as i128).checked_mul(p),
+        Value::HugeInt(x) => x.checked_mul(p),
+        Value::UTinyInt(x) => (*x as i128).checked_mul(p),
+        Value::USmallInt(x) => (*x as i128).checked_mul(p),
+        Value::UInt(x) => (*x as i128).checked_mul(p),
+        Value::UBigInt(x) => (*x as i128).checked_mul(p),
+        _ => None,
+    }
+}
+
+fn uuid_raw(v: &Value) -> Option<UuidValueRaw> {
+    match v {
+        Value::Text(t) => uuid::Uuid::parse_str(t.trim()).ok().map(|u| UuidValueRaw::from_bytes(*u.as_bytes())),
+        Value::Blob(b) => <[u8; 16]>::try_from(b.as_slice()).ok().map(UuidValueRaw::from_bytes),
+        _ => None,
+    }
+}
+
+/// Write column `c` of `rows` into `chunk` as `kind` (the vector gets `rows.len()` rows). A value
+/// that does not fit `kind` is an error naming the column index and the value.
+pub fn write_column<C: ChunkMut + ?Sized>(chunk: &mut C, c: usize, kind: Kind, rows: &[Vec<Value>]) -> Result<()> {
     let n = rows.len();
     macro_rules! fill {
         ($t:ty, $($p:pat => $e:expr),+) => {{
-            let mut v = chunk.get_vector_at_mut::<$t>(c).d()?;
+            let mut v = chunk.vector_mut::<$t>(c).d()?;
             v.set_size(n).d()?;
             for (i, r) in rows.iter().enumerate() {
                 match &r[c] {
                     $($p => v.write(i, Some($e)).d()?,)+
                     Value::Null => v.write(i, None).d()?,
-                    other => bail!("appender: value {other:?} does not fit column {c} ({kind:?})"),
+                    other => bail!("value {other:?} does not fit column {c} ({kind:?})"),
                 }
             }
         }};
@@ -975,9 +1096,40 @@ fn write_column(chunk: &mut DataChunk<'_>, c: usize, kind: Kind, rows: &[Vec<Val
         Kind::TsUs => fill!(TimestampValue, Value::Timestamp(_, t) => TimestampValue(*t)),
         Kind::TsNs => fill!(TimestampNsValue, Value::Timestamp(_, t) => TimestampNsValue(*t)),
         Kind::Interval => fill!(IntervalValue, Value::Interval { months, days, nanos } => IntervalValue { months: *months, days: *days, micros: *nanos / 1000 }),
+        Kind::TsTz => fill!(TimestampTzValue, Value::Timestamp(u, t) => TimestampTzValue(u.to_micros(*t))),
+        Kind::Uuid => {
+            let mut v = chunk.vector_mut::<UuidValueRaw>(c).d()?;
+            v.set_size(n).d()?;
+            for (i, r) in rows.iter().enumerate() {
+                match &r[c] {
+                    Value::Null => v.write(i, None).d()?,
+                    x => v.write(i, Some(uuid_raw(x).ok_or_else(|| anyhow!("value {x:?} does not fit column {c} (UUID)"))?)).d()?,
+                }
+            }
+        }
+        Kind::Decimal { width, scale } => {
+            macro_rules! dec {
+                ($t:ident, $int:ty) => {{
+                    let mut v = chunk.vector_mut::<$t>(c).d()?;
+                    v.set_size(n).d()?;
+                    let limit = 10i128.pow(width as u32);
+                    for (i, r) in rows.iter().enumerate() {
+                        match &r[c] {
+                            Value::Null => v.write(i, None).d()?,
+                            x => {
+                                let m = decimal_mantissa(x, scale).filter(|m| m.abs() < limit)
+                                    .ok_or_else(|| anyhow!("value {x:?} does not fit column {c} (DECIMAL({width},{scale}))"))?;
+                                v.write(i, Some($t(m as $int))).d()?
+                            }
+                        }
+                    }
+                }};
+            }
+            match width { 1..=4 => dec!(ShortDecimal, i16), 5..=9 => dec!(WordDecimal, i32), 10..=18 => dec!(LongDecimal, i64), _ => dec!(HugeDecimal, i128) }
+        }
         Kind::Text => {
             let texts: Vec<Option<String>> = rows.iter().map(|r| match &r[c] { Value::Text(_) | Value::Enum(_) => None, v => value_text(v) }).collect();
-            let mut v = chunk.get_vector_at_mut::<String>(c).d()?;
+            let mut v = chunk.vector_mut::<String>(c).d()?;
             v.set_size(n).d()?;
             for (i, r) in rows.iter().enumerate() {
                 match (&r[c], &texts[i]) {
@@ -989,6 +1141,22 @@ fn write_column(chunk: &mut DataChunk<'_>, c: usize, kind: Kind, rows: &[Vec<Val
         }
     }
     Ok(())
+}
+
+/// Arrow record batches from what duckdb-neo's `ArrowExporter` produced: its schema and arrays
+/// (C data interface structs), imported into our `arrow` crate as `ArrowResult` does for query
+/// results.
+pub fn import_arrow(schema: neo::arrow::ArrowSchema, arrays: Vec<neo::arrow::ArrowArray>) -> Result<Vec<RecordBatch>> {
+    // SAFETY: duckdb-neo's ArrowSchema / ArrowArray are the Arrow C data interface structs, as arrow's FFI types.
+    let ffi_schema: FFI_ArrowSchema = unsafe { std::mem::transmute::<neo::ffi::ArrowSchema, FFI_ArrowSchema>(schema.into_raw()) };
+    let schema = Arc::new(Schema::try_from(&ffi_schema).context("reading the exported Arrow schema")?);
+    arrays.into_iter().map(|a| {
+        let ffi_array: FFI_ArrowArray = unsafe { std::mem::transmute::<neo::ffi::ArrowArray, FFI_ArrowArray>(a.into_raw()) };
+        let data = unsafe { arrow::ffi::from_ffi(ffi_array, &ffi_schema) }.context("importing an exported Arrow array")?;
+        let sa = StructArray::from(data);
+        let (_, columns, _) = sa.into_parts();
+        RecordBatch::try_new(schema.clone(), columns).context("building a record batch from an exported Arrow array")
+    }).collect()
 }
 
 // ------------------------------------------------------------------ Arrow streaming
@@ -1037,4 +1205,63 @@ pub fn arrow_batches<'c>(con: &'c Connection, sql: &str) -> Result<impl Iterator
         Ok(None) => None,
         Err(e) => Some(Err(e)),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neo_decimal_and_uuid_values() {
+        let t = |s: &str| Value::Text(s.into());
+        assert_eq!(decimal_mantissa(&t("12.5"), 2), Some(1250));
+        assert_eq!(decimal_mantissa(&t("-0.505"), 2), Some(-51));
+        assert_eq!(decimal_mantissa(&t("123."), 0), Some(123));
+        assert_eq!(decimal_mantissa(&t("0.0000"), 4), Some(0));
+        assert_eq!(decimal_mantissa(&t("+7"), 3), Some(7000));
+        assert_eq!(decimal_mantissa(&Value::Double(0.125), 2), Some(13));
+        assert_eq!(decimal_mantissa(&Value::Double(-2.5), 0), Some(-3));
+        assert_eq!(decimal_mantissa(&Value::Decimal(Decimal::new(10, 3, 1234).unwrap()), 1), Some(12));
+        assert_eq!(decimal_mantissa(&Value::BigInt(-4), 2), Some(-400));
+        for bad in ["", ".", "1e5", "abc", "1.2.3", "99999999999999999999999999999999999999999"] { assert_eq!(decimal_mantissa(&t(bad), 2), None, "{bad}"); }
+        let u = "6f1b5a2e-0c3d-4e5f-8a9b-0123456789ab";
+        let raw = uuid_raw(&t(u)).unwrap();
+        assert_eq!(uuid::Uuid::from_bytes(raw.to_bytes()).to_string(), u);
+        assert_eq!(uuid_raw(&Value::Blob(uuid::Uuid::parse_str(u).unwrap().as_bytes().to_vec())), Some(raw));
+        assert_eq!(uuid_raw(&t("nope")), None);
+    }
+
+    /// The kinds `bridge_scan` writes (DECIMAL widths, UUID, TIMESTAMPTZ, text) round-trip through a chunk.
+    #[test]
+    fn neo_write_column_scan_kinds() {
+        let con = open_in_memory().unwrap();
+        exec(&con, "SET TimeZone = 'UTC'; CREATE TABLE t (a DECIMAL(4,1), b DECIMAL(9,2), c DECIMAL(18,3), d DECIMAL(38,4), u UUID, z TIMESTAMPTZ, s VARCHAR, x UTINYINT)").unwrap();
+        let names = ["DECIMAL(4,1)", "DECIMAL(9,2)", "DECIMAL(18,3)", "DECIMAL(38,4)", "UUID", "TIMESTAMP WITH TIME ZONE", "VARCHAR", "UTINYINT"];
+        let types: Vec<LogicalType> = names.iter().map(|n| LogicalType::from_text(&con.con, n).unwrap()).collect();
+        let kinds: Vec<Kind> = types.iter().map(|t| Kind::of_type(t).unwrap()).collect();
+        assert_eq!(&kinds[..2], &[Kind::Decimal { width: 4, scale: 1 }, Kind::Decimal { width: 9, scale: 2 }]);
+        assert_eq!(&kinds[4..], &[Kind::Uuid, Kind::TsTz, Kind::Text, Kind::U8]);
+        assert_eq!(Kind::of_type(&LogicalType::from_text(&con.con, "INTEGER[]").unwrap()), None);
+        let t = |s: &str| Value::Text(s.into());
+        let rows = vec![
+            vec![t("-999.9"), t("1234567.89"), Value::Double(1.0005), t("-12345678901234567890123456789012.3456"), t("6f1b5a2e-0c3d-4e5f-8a9b-0123456789ab"),
+                 Value::Timestamp(TimeUnit::Microsecond, 1_000_001), Value::Int(7), Value::UTinyInt(255)],
+            vec![Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null],
+        ];
+        let mut chunk = DataChunk::create(&con.con, &types, true).unwrap();
+        for (c, k) in kinds.iter().enumerate() { write_column(&mut chunk, c, *k, &rows).unwrap(); }
+        let mut app = ColumnDataCollection::new(&con.con, types.clone()).d().unwrap().to_append().d().unwrap();
+        app.append(&mut chunk).d().unwrap();
+        let stmt = con.con.parse("INSERT INTO t SELECT * FROM __w").d().unwrap().next().unwrap().d().unwrap().add_collection(app.to_normal(), "__w").d().unwrap();
+        stmt.query(&con.con, Parameters::None).d().unwrap().drain().d().unwrap();
+        let got: Vec<String> = query_rows(&con, "SELECT concat_ws('|', a, b, c, d, u, z, s, x) FROM t ORDER BY a NULLS LAST", |r| r.get(0)).unwrap();
+        assert_eq!(got, ["-999.9|1234567.89|1.001|-12345678901234567890123456789012.3456|6f1b5a2e-0c3d-4e5f-8a9b-0123456789ab|1970-01-01 00:00:01.000001+00|7|255", ""]);
+        // values that do not fit name the column and the value
+        let e = write_column(&mut chunk, 0, kinds[0], &[vec![t("1000.0")]]).unwrap_err().to_string();
+        assert!(e.contains("column 0") && e.contains("DECIMAL(4,1)") && e.contains("1000.0"), "{e}");
+        let mut bad = rows[1].clone();
+        bad[4] = t("x");
+        let e = write_column(&mut chunk, 4, kinds[4], &[bad]).unwrap_err().to_string();
+        assert!(e.contains("column 4 (UUID)"), "{e}");
+    }
 }

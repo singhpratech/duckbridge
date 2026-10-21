@@ -461,7 +461,7 @@ done; the plan for the rest, in priority order:
 | 1 | SQL Server 2019 / 2022 / 2025 | import, live load, `.bak`, T-SQL ⇄ DuckDB | done |
 | 1 | PostgreSQL | export via `COPY`, DuckDB ⇄ PostgreSQL SQL | export done; import next |
 | 1 | Parquet | export, any engine can absorb it | done |
-| 2 | **DuckDB extension** (`duckbridge`) | `bridge_import`, `bridge_export`, `bridge_run`, `bridge_transpile` straight from DuckDB SQL | done; in the community registry (1.5.6 line); DuckDB 2.0 port waits on `duckdb-neo` |
+| 2 | **DuckDB extension** (`duckbridge`) | `bridge_import`, `bridge_export`, `bridge_run`, `bridge_transpile` straight from DuckDB SQL | done; one binary for DuckDB 1.5.6 and 2.x (stable v1 C API); native 2.0 build (`duckdb-neo`): `bridge_scan`/`bridge_tables`/`PRAGMA bridge_import`/`PRAGMA bridge_run`/`COPY TO` |
 | 2 | PostgreSQL import | binary `COPY TO STDOUT`, key-range parallel streams, identity → sequence | planned |
 | 3 | MySQL / MariaDB | `LOAD DATA LOCAL INFILE`, MySQL dialect rules | planned |
 | 3 | Oracle | `SQL*Loader`-style direct path over OCI-free wire protocol, PL/SQL-lite rules | planned |
@@ -548,16 +548,75 @@ touches your transaction. Two consequences worth knowing: `parallel` is capped a
 database stays open until the process exits, so a `.wal` file may remain next to the database
 after a session that used the bridge (DuckDB replays it on the next open; the bridge checkpoints
 after each operation to keep it small). The extension is built on DuckDB's C extension API via
-`duckdb-rs`, which currently requires the *unstable* struct, so each binary is pinned to one
-DuckDB release (`v1.5.6` today, see `extension/Makefile`). CI builds Linux x86_64/arm64,
-macOS Intel/ARM and Windows. The extension is in the DuckDB community registry
+`duckdb-rs` against the *stable* v1 API table (floor `v1.5.6`, footer `C_STRUCT`, see
+`extension/Makefile`), so one binary loads on DuckDB 1.5.6 and on DuckDB 2.x, whose loader keeps
+serving that table. CI builds Linux x86_64/arm64, macOS Intel/ARM and Windows. The extension is in
+the DuckDB community registry
 ([duckdb/community-extensions#3147](https://github.com/duckdb/community-extensions/pull/3147), built from
-[duckbridge-extension](https://github.com/singhpratech/duckbridge-extension)). One caveat: the registry
-now builds for the upcoming DuckDB 2.0, whose extensions need a new C API that the Rust bindings
-(`duckdb-neo`) do not ship yet, so `INSTALL duckbridge FROM community` works only once a 1.5.6 build is
-served there or the 2.0 port lands. On DuckDB 1.5.6, download the `duckbridge-<platform>.duckdb_extension.zip`
-from the [releases](https://github.com/singhpratech/duckbridge/releases) and load it with
-`duckdb -unsigned` or `SET allow_unsigned_extensions = true`.
+[duckbridge-extension](https://github.com/singhpratech/duckbridge-extension)); the registry builds for
+DuckDB 2.0.0, and the 0.1.1 binary it holds was still packed with the version-pinned (`C_STRUCT_UNSTABLE`)
+footer, which 2.0 refuses. Until the next registry build lands, download the
+`duckbridge-<platform>.duckdb_extension.zip` from the
+[releases](https://github.com/singhpratech/duckbridge/releases) and load it with `duckdb -unsigned` or
+`SET allow_unsigned_extensions = true`.
+
+### DuckDB 2.0
+
+The standard build above runs on DuckDB 2.0 unchanged, through the v1 API table 2.0 still serves,
+with every function of the 1.x section (`scripts/e2e_extension.sh` passes 33/33 on both engines).
+DuckDB 2.0 also has a new, v2 C API, and an extension written against it gets no connection back to
+the database that loaded it, so the 1.x design (the extension opens a pool and runs SQL on it) cannot
+exist there. DuckBridge therefore has a second, native 2.0 build (`duckdb-neo`, `make release-neo`,
+see `docs/plan-2.0-extension.md`) for the day the v1 table goes away. It turns the arrow around:
+DuckDB calls into DuckBridge through table functions (rows out), a `COPY` function (rows in) and
+pragmas that return SQL text for DuckDB to run. The names differ from the 1.x section above, and
+`bridge_transpile` and `bridge_prelude` are unchanged:
+
+```sql
+LOAD duckbridge;
+
+SELECT * FROM bridge_tables('mssql://sa:p%40ss@sql01:1433/Sales', tables := 'dbo.*', exclude := 'dbo.v_*');   -- catalog: schema, name, kind, rows, columns, pk, import_sql
+SELECT * FROM bridge_scan('mssql://sa:p%40ss@sql01:1433/Sales', 'dbo.orders');          -- one table, streamed over TDS
+SELECT * FROM bridge_scan(dsn, 'SELECT id, total FROM dbo.orders WHERE total > 100');   -- or any query
+CREATE TABLE orders AS FROM bridge_scan(dsn, 'dbo.orders', nolock := true);
+
+PRAGMA bridge_import('mssql://sa:p%40ss@sql01:1433/Sales', tables = 'dbo.*', schema_map = 'dbo=main', keys = true);   -- pragmas take name = value
+PRAGMA bridge_run('UPDATE dbo.orders SET total = qty * price WHERE total IS NULL', strict = true);
+
+COPY orders TO 'mssql://sa:p%40ss@sql01:1433/Sales/dbo.orders' (FORMAT duckbridge);
+COPY (SELECT * FROM kpi) TO 'mssql://sa:p%40ss@sql01:1433/Sales/dbo.kpi' (FORMAT duckbridge, CREATE true, BATCH_ROWS 50000, SORT_BY 'id');
+```
+
+Table functions keep DuckDB's `name := value` syntax. PRAGMA arguments are written `name = value`, because
+DuckDB's pragma grammar has no `:=`. `PRAGMA bridge_import` returns a script that DuckDB runs in place of
+the pragma: the importer's own DDL (schemas, identity sequences, tables with NOT NULL, defaults, primary,
+unique and foreign keys), one `INSERT INTO t (cols) SELECT cols FROM bridge_scan(...)` per table in foreign
+key order, the translated views, and a closing summary `SELECT` in the 1.x `(object, kind, rows, note)`
+shape. `keys = false` drops all constraints. (`bridge_tables` returns the simpler
+`CREATE TABLE ... AS FROM bridge_scan(...)` per table in `import_sql`, empty for views.) `PRAGMA bridge_run`
+translates the T-SQL and runs it in the current database, prelude first. DuckDB 2.0 refuses a pragma
+expansion in which a row-returning statement is followed by other statements, so `bridge_run` leaves out
+the `SELECT`s that come before the last statement (a comment in the script marks them) and returns the
+rows of the last one; the prelude settings stay on the session unless `reset = true`, which keeps the last
+statement's rows in a temp table, resets the settings and then selects them. The table filters take names,
+`schema.name` and `*` / `?` globs. `money` and `smallmoney` scan as `DECIMAL(19,4)` and `DECIMAL(10,4)`.
+The COPY path is `mssql://user:pw@host:port/Database/schema.table`; the table must exist unless
+`CREATE true`, and the database is never created by `COPY`. `COPY` rejects nested types (`LIST`, `ARRAY`,
+`STRUCT`, `MAP`, `UNION`) at bind, naming the column; use `to_json(col)`. Unknown COPY options are errors.
+The 1.x names `bridge_import(...)`, `bridge_export(...)` and `bridge_run(...)` as table functions still
+exist on 2.0 and fail with a message naming the replacement.
+
+| Call | Named parameters / options (default) |
+|---|---|
+| `bridge_tables` | `tables` (all), `exclude` (none), `schema_map` (none), and the `bridge_scan` options |
+| `bridge_scan` | `nolock` (false), `batch_rows` (50000), `lock_timeout` ms (1000), `isolation` (`read-committed`, `read-uncommitted`, `snapshot`), `readonly` (false) |
+| `PRAGMA bridge_import` | `tables` (all), `exclude` (none), `schema_map` (none), `keys` (true), `keys_after_load` (false), `overwrite` (false), `views` (true), `schema_only` (false), and the `bridge_scan` options |
+| `PRAGMA bridge_run` | `dialect` (`tsql`; `from` is a reserved word in pragma arguments), `nocase_mode` (`rewrite`, `global`, `off`), `strict` (false), `mssql_math` (false), `types` (a spec such as `'col=decimal(18,4)'`), `schema_map` (none), `reset` (false) |
+| `COPY ... TO 'mssql://...'` | `FORMAT duckbridge`, `CREATE` (false; `CREATE_TABLE` also works), `DROP_EXISTING` (false), `KEEP_IDENTITY` (false), `TABLE_LOCK` (true), `BATCH_ROWS` (100000), `CHECK_CONSTRAINTS` (true), `SORT_BY` (the bulk ORDER hint; `ORDER_BY` is DuckDB's own COPY option), `STRING_TYPE` (`nvarchar`; `auto`, `varchar`), `TARGET_VERSION` (2019), `TABLE` (overrides the last path segment) |
+
+Not available on 2.0 without a host connection, use the `duckbridge` CLI for these: export targets
+other than SQL Server (`.bak`, parquet, postgres, scripts), parallel and split imports, the import
+manifest, the lock pre-check and the fingerprint re-reads, and plan mode for `COPY`.
 
 ## Build
 

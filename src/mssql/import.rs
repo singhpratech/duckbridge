@@ -87,11 +87,41 @@ pub fn effective_safety(o: &ImportOptions, s: &ReadSafety) -> ReadSafety {
     s
 }
 
+/// `pattern` (lowercase) against `text` (lowercase): `*` = any run of characters, `?` = one character.
+fn glob(pattern: &[char], text: &[char]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some(('*', rest)) => (0..=text.len()).any(|i| glob(rest, &text[i..])),
+        Some((p, rest)) => text.split_first().is_some_and(|(t, tail)| (*p == '?' || p == t) && glob(rest, tail)),
+    }
+}
+
+/// Whether `--tables` / `--exclude` select `schema.name`: each entry is a table name or `schema.name`,
+/// case-insensitive, with `*` / `?` wildcards (`dbo.*`, `sales.v_*`).
 fn wanted(o: &ImportOptions, schema: &str, name: &str) -> bool {
-    let full = format!("{schema}.{name}").to_lowercase();
-    let n = name.to_lowercase();
-    if !o.include.is_empty() && !o.include.iter().any(|i| { let i = i.to_lowercase(); i == n || i == full }) { return false; }
-    !o.exclude.iter().any(|e| { let e = e.to_lowercase(); e == n || e == full })
+    let full: Vec<char> = format!("{schema}.{name}").to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    let hit = |p: &String| { let p: Vec<char> = p.to_lowercase().chars().collect(); glob(&p, &n) || glob(&p, &full) };
+    if !o.include.is_empty() && !o.include.iter().any(hit) { return false; }
+    !o.exclude.iter().any(hit)
+}
+
+/// The SELECT-list expression that reads a column of SQL Server type `type_name` over TDS (types
+/// tiberius cannot decode, or DuckDB has no counterpart for, are cast or rendered as text).
+pub(crate) fn select_expr(type_name: &str, column: &str) -> String {
+    let q = bracket(column);
+    match type_name.to_lowercase().as_str() {
+        "xml" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
+        "hierarchyid" | "geography" | "geometry" => format!("{q}.ToString() AS {q}"),
+        "sql_variant" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
+        "text" => format!("CAST({q} AS VARCHAR(MAX)) AS {q}"),
+        "ntext" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
+        "image" => format!("CAST({q} AS VARBINARY(MAX)) AS {q}"),
+        "timestamp" | "rowversion" => format!("CAST({q} AS BINARY(8)) AS {q}"),
+        "json" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
+        "vector" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
+        _ => q,
+    }
 }
 
 /// [`read_catalog_with`] with the default read-safety settings.
@@ -140,19 +170,7 @@ pub async fn read_catalog_with(c: &mut MsClient, o: &ImportOptions, safety: &Rea
         let increment: i64 = r.get(10).unwrap_or(0);
         let (duck_type, w) = mssql_to_duck(&type_name, max_length, precision, scale);
         if let Some(w) = w { warnings.push(format!("{schema}.{name}.{cname}: {w}")); }
-        let q = bracket(&cname);
-        let select_expr = match type_name.to_lowercase().as_str() {
-            "xml" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
-            "hierarchyid" | "geography" | "geometry" => format!("{q}.ToString() AS {q}"),
-            "sql_variant" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
-            "text" => format!("CAST({q} AS VARCHAR(MAX)) AS {q}"),
-            "ntext" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
-            "image" => format!("CAST({q} AS VARBINARY(MAX)) AS {q}"),
-            "timestamp" | "rowversion" => format!("CAST({q} AS BINARY(8)) AS {q}"),
-            "json" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
-            "vector" => format!("CAST({q} AS NVARCHAR(MAX)) AS {q}"),
-            _ => q.clone(),
-        };
+        let select_expr = select_expr(&type_name, &cname);
         tables.last_mut().unwrap().columns.push(MsColumn { name: cname, type_name, max_length, precision, scale, nullable, is_identity, seed, increment, duck_type, select_expr });
     }
     // keys
@@ -234,11 +252,21 @@ fn topo_order(tables: &[MsTable], warnings: &mut Vec<String>) -> (Vec<usize>, Ha
     (order, dropped_fks)
 }
 
-pub fn create_duck_schema(con: &Connection, tables: &[MsTable], views: &[MsView], o: &ImportOptions, warnings: &mut Vec<String>) -> Result<Vec<usize>> {
+/// One DuckDB DDL statement of an import; `table` (`schema.name` on SQL Server) marks a CREATE TABLE.
+pub struct DuckDdl {
+    pub sql: String,
+    pub table: Option<String>,
+}
+
+/// The DuckDB DDL of an import in execution order: schemas, identity sequences, tables (FK targets
+/// first). Returns the statements and the table order. [`create_duck_schema`] runs them; the DuckDB 2.0
+/// extension's `PRAGMA bridge_import` hands them to DuckDB as script text.
+pub fn duck_schema_sql(tables: &[MsTable], views: &[MsView], o: &ImportOptions, warnings: &mut Vec<String>) -> (Vec<DuckDdl>, Vec<usize>) {
     let sm = |s: &str| o.schema_map.get(s).cloned().unwrap_or_else(|| s.to_string());
+    let mut out = vec![];
     let mut schemas: Vec<String> = tables.iter().map(|t| sm(&t.schema)).chain(views.iter().map(|v| sm(&v.schema))).collect();
     schemas.sort(); schemas.dedup();
-    for s in &schemas { if s != "main" { duck::exec(con, &format!("CREATE SCHEMA IF NOT EXISTS {}", quote_duck(s)))?; } }
+    for s in &schemas { if s != "main" { out.push(DuckDdl { sql: format!("CREATE SCHEMA IF NOT EXISTS {}", quote_duck(s)), table: None }); } }
     let (order, dropped) = topo_order(tables, warnings);
     for &i in &order {
         let t = &tables[i];
@@ -248,7 +276,7 @@ pub fn create_duck_schema(con: &Connection, tables: &[MsTable], views: &[MsView]
             if !c.nullable { l.push_str(" NOT NULL"); }
             if c.is_identity {
                 let seq = format!("seq_{}_{}", t.name, c.name).chars().map(|ch| if ch.is_alphanumeric() || ch == '_' { ch } else { '_' }).collect::<String>();
-                duck::exec(con, &format!("CREATE SEQUENCE IF NOT EXISTS {}.{} START {} INCREMENT {}", quote_duck(&sm(&t.schema)), quote_duck(&seq), c.seed, c.increment.max(1)))?;
+                out.push(DuckDdl { sql: format!("CREATE SEQUENCE IF NOT EXISTS {}.{} START {} INCREMENT {}", quote_duck(&sm(&t.schema)), quote_duck(&seq), c.seed, c.increment.max(1)), table: None });
                 l.push_str(&format!(" DEFAULT nextval('{}.{}')", sm(&t.schema), seq));
             }
             lines.push(l);
@@ -262,42 +290,76 @@ pub fn create_duck_schema(con: &Connection, tables: &[MsTable], views: &[MsView]
             lines.push(format!("FOREIGN KEY ({}) REFERENCES {}.{} ({})", fk.0.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", "), quote_duck(&sm(&fk.1)), quote_duck(&fk.2), fk.3.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", ")));
         }
         let ddl = format!("CREATE TABLE {}.{} (\n  {}\n)", quote_duck(&sm(&t.schema)), quote_duck(&t.name), lines.join(",\n  "));
-        duck::exec(con, &ddl).with_context(|| format!("creating DuckDB table {}.{}:\n{ddl}", t.schema, t.name))?;
+        out.push(DuckDdl { sql: ddl, table: Some(format!("{}.{}", t.schema, t.name)) });
+    }
+    (out, order)
+}
+
+pub fn create_duck_schema(con: &Connection, tables: &[MsTable], views: &[MsView], o: &ImportOptions, warnings: &mut Vec<String>) -> Result<Vec<usize>> {
+    let (ddl, order) = duck_schema_sql(tables, views, o, warnings);
+    for d in ddl {
+        match &d.table {
+            Some(t) => duck::exec(con, &d.sql).with_context(|| format!("creating DuckDB table {t}:\n{}", d.sql))?,
+            None => duck::exec(con, &d.sql)?,
+        }
     }
     Ok(order)
 }
 
-/// With --keys-after-load: add PRIMARY KEY / UNIQUE constraints now that the data is in.
-pub fn add_keys(con: &Connection, tables: &[MsTable], o: &ImportOptions, warnings: &mut Vec<String>) -> Result<()> {
-    if !o.keys_after_load { return Ok(()); }
+/// One key added after the load (`--keys-after-load`): the table (`schema.name` on SQL Server), what
+/// it is (`primary key` / `unique index`) and the DuckDB statement.
+pub struct KeyDdl {
+    pub table: String,
+    pub what: &'static str,
+    pub sql: String,
+}
+
+/// The `ALTER TABLE ... ADD PRIMARY KEY` / `CREATE UNIQUE INDEX` statements of `--keys-after-load`
+/// (none without it).
+pub fn keys_sql(tables: &[MsTable], o: &ImportOptions) -> Vec<KeyDdl> {
+    if !o.keys_after_load { return vec![]; }
     let sm = |s: &str| o.schema_map.get(s).cloned().unwrap_or_else(|| s.to_string());
+    let mut out = vec![];
     for t in tables {
         let tref = format!("{}.{}", quote_duck(&sm(&t.schema)), quote_duck(&t.name));
+        let table = format!("{}.{}", t.schema, t.name);
         if !t.pk.is_empty() {
-            let sql = format!("ALTER TABLE {tref} ADD PRIMARY KEY ({})", t.pk.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", "));
-            if let Err(e) = duck::exec(con, &sql) { warnings.push(format!("{}.{}: primary key not added: {}", t.schema, t.name, e.to_string().lines().next().unwrap_or(""))); }
+            out.push(KeyDdl { table: table.clone(), what: "primary key", sql: format!("ALTER TABLE {tref} ADD PRIMARY KEY ({})", t.pk.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", ")) });
         }
         for u in &t.uniques {
-            let sql = format!("CREATE UNIQUE INDEX {} ON {tref} ({})", quote_duck(&format!("uq_{}_{}", t.name, u.join("_"))), u.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", "));
-            if let Err(e) = duck::exec(con, &sql) { warnings.push(format!("{}.{}: unique index not added: {}", t.schema, t.name, e.to_string().lines().next().unwrap_or(""))); }
+            out.push(KeyDdl { table: table.clone(), what: "unique index", sql: format!("CREATE UNIQUE INDEX {} ON {tref} ({})", quote_duck(&format!("uq_{}_{}", t.name, u.join("_"))), u.iter().map(|c| quote_duck(c)).collect::<Vec<_>>().join(", ")) });
         }
+    }
+    out
+}
+
+/// With --keys-after-load: add PRIMARY KEY / UNIQUE constraints now that the data is in.
+pub fn add_keys(con: &Connection, tables: &[MsTable], o: &ImportOptions, warnings: &mut Vec<String>) -> Result<()> {
+    for k in keys_sql(tables, o) {
+        if let Err(e) = duck::exec(con, &k.sql) { warnings.push(format!("{}: {} not added: {}", k.table, k.what, e.to_string().lines().next().unwrap_or(""))); }
     }
     Ok(())
 }
 
-pub fn create_duck_views(con: &Connection, views: &[MsView], o: &ImportOptions, warnings: &mut Vec<String>) {
+/// The DuckDB `CREATE OR REPLACE VIEW` for a SQL Server view (definition translated from T-SQL) and
+/// the translator's warnings; `Err` with the reason when it does not translate.
+pub fn duck_view_sql(v: &MsView, o: &ImportOptions) -> std::result::Result<(String, Vec<String>), String> {
     let sm = |s: &str| o.schema_map.get(s).cloned().unwrap_or_else(|| s.to_string());
+    let tr = transpile::translate(&v.definition, Dialect::Tsql, Dialect::DuckDb, &o.schema_map).map_err(|e| e.to_string())?;
+    // definition is "CREATE VIEW [s].[v] AS SELECT ..."; re-target name into DuckDB
+    let select = transpile::view_body(&tr.sql, false);
+    Ok((format!("CREATE OR REPLACE VIEW {}.{} AS {}", quote_duck(&sm(&v.schema)), quote_duck(&v.name), select), tr.warnings))
+}
+
+pub fn create_duck_views(con: &Connection, views: &[MsView], o: &ImportOptions, warnings: &mut Vec<String>) {
     let mut pending: Vec<&MsView> = views.iter().collect();
     for _ in 0..3 {
         let mut failed = vec![];
         for v in pending {
-            match transpile::translate(&v.definition, Dialect::Tsql, Dialect::DuckDb, &o.schema_map) {
-                Ok(tr) => {
-                    // definition is "CREATE VIEW [s].[v] AS SELECT ..."; re-target name into DuckDB
-                    let select = transpile::view_body(&tr.sql, false);
-                    let ddl = format!("CREATE OR REPLACE VIEW {}.{} AS {}", quote_duck(&sm(&v.schema)), quote_duck(&v.name), select);
+            match duck_view_sql(v, o) {
+                Ok((ddl, tr_warnings)) => {
                     match duck::exec(con, &ddl) {
-                        Ok(_) => { for w in tr.warnings { warnings.push(format!("view {}.{}: {w}", v.schema, v.name)); } }
+                        Ok(_) => { for w in tr_warnings { warnings.push(format!("view {}.{}: {w}", v.schema, v.name)); } }
                         Err(e) => failed.push((v, e.to_string())),
                     }
                 }
@@ -633,7 +695,9 @@ async fn copy_one(con: &Connection, client: &mut SourceClient, t: &MsTable, rang
     Ok(n)
 }
 
-fn column_to_value(c: ColumnData<'static>) -> Value {
+/// One TDS value as a DuckDB value (DECIMAL/NUMERIC and uniqueidentifier as text, `datetimeoffset` as
+/// its UTC instant, every timestamp in microseconds).
+pub fn column_to_value(c: ColumnData<'static>) -> Value {
     use ColumnData as C;
     match c {
         C::Bit(b) => b.map(Value::Boolean).unwrap_or(Value::Null),
@@ -650,13 +714,14 @@ fn column_to_value(c: ColumnData<'static>) -> Value {
         C::Xml(x) => x.map(|x| Value::Text(x.to_string())).unwrap_or(Value::Null),
         C::Date(d) => d.map(|d| { let nd: chrono::NaiveDate = chrono::NaiveDate::from_num_days_from_ce_opt(d.days() as i32 + 1).unwrap_or_default(); Value::Date32((nd - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32) }).unwrap_or(Value::Null),
         C::Time(t) => t.map(|t| Value::Time64(TimeUnit::Microsecond, time_micros(&t))).unwrap_or(Value::Null),
-        C::DateTime(dt) => dt.map(|dt| Value::Timestamp(TimeUnit::Microsecond, (dt.days() as i64 - 25_567) * 86_400_000_000 + (dt.seconds_fragments() as i64) * 1_000_000 / 300)).unwrap_or(Value::Null),
+        // datetime ticks are 1/300 s; SQL Server renders them rounded to the millisecond (.000/.003/.007),
+        // so .123 is tick 37 = 123.33 ms -> 123 ms, not 123333 us
+        C::DateTime(dt) => dt.map(|dt| Value::Timestamp(TimeUnit::Microsecond, (dt.days() as i64 - 25_567) * 86_400_000_000 + ((dt.seconds_fragments() as i64 * 1000 + 150) / 300) * 1000)).unwrap_or(Value::Null),
         C::SmallDateTime(dt) => dt.map(|dt| Value::Timestamp(TimeUnit::Microsecond, (dt.days() as i64 - 25_567) * 86_400_000_000 + dt.seconds_fragments() as i64 * 60_000_000)).unwrap_or(Value::Null),
         C::DateTime2(dt) => dt.map(|dt| Value::Timestamp(TimeUnit::Microsecond, dt2_micros(&dt))).unwrap_or(Value::Null),
-        C::DateTimeOffset(dto) => dto.map(|dto| {
-            let micros = dt2_micros(&dto.datetime2()) - dto.offset() as i64 * 60_000_000; // stored local; convert to UTC
-            Value::Timestamp(TimeUnit::Microsecond, micros)
-        }).unwrap_or(Value::Null),
+        // TDS sends a datetimeoffset as its UTC date/time plus the offset (as tiberius encodes it), so the
+        // date/time part is the instant already
+        C::DateTimeOffset(dto) => dto.map(|dto| Value::Timestamp(TimeUnit::Microsecond, dt2_micros(&dto.datetime2()))).unwrap_or(Value::Null),
     }
 }
 
@@ -677,6 +742,38 @@ fn dt2_micros(dt: &tiberius::time::DateTime2) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_table_filter_globs() {
+        let o = |inc: &[&str], exc: &[&str]| ImportOptions { keys_after_load: false, include: inc.iter().map(|s| s.to_string()).collect(), exclude: exc.iter().map(|s| s.to_string()).collect(),
+            parallel: 1, split_threshold: 0, batch_rows: 1, schema_map: HashMap::new(), nolock: false };
+        assert!(wanted(&o(&[], &[]), "dbo", "orders"));
+        assert!(wanted(&o(&["Orders"], &[]), "dbo", "orders") && wanted(&o(&["DBO.orders"], &[]), "dbo", "orders"));
+        assert!(!wanted(&o(&["orders"], &[]), "dbo", "orders2"));
+        assert!(wanted(&o(&["dbo.*"], &[]), "dbo", "orders") && !wanted(&o(&["dbo.*"], &[]), "sales", "orders"));
+        assert!(!wanted(&o(&["dbo.*"], &["dbo.v_*"]), "dbo", "v_totals") && wanted(&o(&["dbo.*"], &["dbo.v_*"]), "dbo", "vat"));
+        assert!(wanted(&o(&["ord?rs"], &[]), "dbo", "orders") && wanted(&o(&["*"], &[]), "x", "y") && !wanted(&o(&[], &["*.*"]), "x", "y"));
+    }
+
+    #[test]
+    fn import_datetimeoffset_is_the_utc_instant() {
+        use tiberius::time::{Date, DateTime2, DateTimeOffset, Time};
+        // 2021-07-01 01:00:00.1234567 UTC (days since 0001-01-01: 737971), sent with offset -02:00
+        let dto = DateTimeOffset::new(DateTime2::new(Date::new(737_971), Time::new(36_001_234_567, 7)), -120);
+        let want = (737_971i64 - 719_162) * 86_400_000_000 + 3_600_123_456;
+        assert_eq!(column_to_value(ColumnData::DateTimeOffset(Some(dto))), Value::Timestamp(TimeUnit::Microsecond, want));
+        assert_eq!(column_to_value(ColumnData::DateTimeOffset(None)), Value::Null);
+    }
+
+    #[test]
+    fn datetime_ticks_round_to_milliseconds() {
+        use tiberius::time::DateTime;
+        // 2024-03-15 = 45_366 days after 1900-01-01; ticks are 1/300 s
+        let day = (45_366i64 - 25_567) * 86_400_000_000;
+        for (ticks, ms) in [(37u32, 123i64), (299, 997), (1, 3), (0, 0), (150, 500)] {
+            assert_eq!(column_to_value(ColumnData::DateTime(Some(DateTime::new(45_366, ticks)))), Value::Timestamp(TimeUnit::Microsecond, day + ms * 1000), "ticks {ticks}");
+        }
+    }
 
     fn shared(jobs: Vec<Job>) -> Shared {
         let mut table_jobs: HashMap<usize, Vec<Job>> = HashMap::new();

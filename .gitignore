@@ -8,3 +8,4 @@ tests/fixtures/sample.duckdb
 /private/
 /neo/target
 /extension/neo/target
+__pycache__/

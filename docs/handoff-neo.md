@@ -21,14 +21,15 @@ Commits (on top of step 1):
 
 | | duckdb-v1 (default) | duckdb-neo (DuckDB v2.0.0-alpha49003) |
 |---|---|---|
-| `cargo test --release` (lib + translator) | 94 + 81 pass | 94 + 81 pass |
+| `cargo test --release` (lib + translator) | 102 + 81 pass | 104 + 81 pass |
 | `scripts/e2e_mssql.sh` | 45/45 | 45/45 |
 | `scripts/e2e_large_load.sh` | 118/118 | 118/118 |
-| extension | `make release` + `e2e_extension.sh` 33/33 | `make release-neo` + `e2e_extension_neo.py`: 13 pass, 3 blocked (below) |
+| extension | `make release` + `e2e_extension.sh` 33/33 | `make release-neo` + `e2e_extension_neo.py`: 138 pass, 1 fail (`datetime` fraction, see below the table) |
 
-Blocked = `bridge_run` creating a table, `bridge_import` from SQL Server, `bridge_export(...,
-create_database := true, database := '_neo_out')`: the v2 extension API gives no connection (see
-"The extension on neo"). They fail with an explanatory error and touch nothing on SQL Server.
+The one failing `e2e_extension_neo.py` check: `bridge_scan` of a `datetime` column returns the
+fraction in thirds of a millisecond (`10:30:15.123333` for SQL Server's `10:30:15.123`), so the value
+differs from SQL Server's own rendering; the other
+23 type columns, every COPY round trip and all error cases pass.
 
 neo was also run with `download-neo` (prebuilt `libduckdb.so` of the pinned build, which includes
 ICU): `cargo test` 94 + 81 pass. Streaming benchmark (`cargo test --release --lib -- --ignored
@@ -165,58 +166,101 @@ missed). No call site outside `duck/` changed.
 
 ## The extension on neo (`extension/src/duckdb_neo.rs`)
 
-Works: `LOAD` (unsigned, footer `v2.0.0-alpha49003` / `C_STRUCT_UNSTABLE` / platform, entry point
-`duckbridge_init_c_api_v2` from `#[duckdb_entrypoint_c_api_v2(extension_name = "duckbridge",
-api_version = "v2.0.0")]`), `bridge_transpile` (both overloads, registered as two scalar functions
-of the same name, NULL in -> NULL out), `bridge_prelude(BOOLEAN)`.
+The v2 extension API gives an extension no connection to the database that loaded it
+(`duckdb_v2_extension_input` = extension handle, borrowed context, error slot; duckdb-neo's
+`Extension` / `Context` wrap exactly that, `crates/duckdb-neo/src/extension.rs:22`,
+`connection.rs:318`). So on DuckDB 2.0 the extension does not read or write DuckDB tables itself:
+everything is a function DuckDB calls (design: docs/plan-2.0-extension.md, which also lists what
+deviated from it). `LOAD`, the footer (`v2.0.0-alpha49003` / `C_STRUCT_UNSTABLE`), the entry point
+`duckbridge_init_c_api_v2`, `bridge_transpile` (both overloads) and `bridge_prelude` are unchanged.
 
-**Blocked: `bridge_import`, `bridge_export`, `bridge_run`.** They need connections to the database
-that loaded the extension. The v1 glue opens a pool of 64 from `duckdb_extension_access::
-get_database` while loading. The v2 extension API has no equivalent:
+```sql
+SELECT * FROM bridge_tables('mssql://sa:p%40ss@sql01:1433/Sales', tables := 'dbo.*', exclude := 'dbo.v_*');
+SELECT * FROM bridge_scan('mssql://.../Sales', 'dbo.orders', nolock := true);           -- or a SELECT / WITH query
+PRAGMA bridge_import('mssql://.../Sales', tables = 'dbo.*', schema_map = 'dbo=main');   -- PRAGMA arguments: name = value
+PRAGMA bridge_run('UPDATE dbo.orders SET total = qty * price', strict = true);
+COPY orders TO 'mssql://.../Sales/dbo.orders' (FORMAT duckbridge, CREATE true, SORT_BY 'id');
+```
 
-* `duckdb_v2_extension_input` (DuckDB `src/include/duckdb_v2.h:2619`, bindings
-  `crates/libduckdb-sys/src/bindgen_bundled_version_loadable_v2.rs:471`) carries `get_api`, an
-  extension handle, a borrowed context ("valid only until the extension entrypoint returns") and
-  the error slot. No database / instance handle.
-* duckdb-neo wraps exactly that: `crates/duckdb-neo/src/extension.rs:22` (`Extension { handle,
-  context }`), `:41-61` (`run_extension_entrypoint` builds it from `input.extension` /
-  `input.context`).
-* Connections are created only from an instance: `crates/duckdb-neo/src/connection.rs:196`
-  (`Connection::new(instance: &Instance)`, crate-private) via `duckdb_v2_connection_create(instance, ...)`,
-  reached through `Instance::connect` (`crates/duckdb-neo/src/instance.rs:296`).
-* `Context` (`crates/duckdb-neo/src/connection.rs:318-341`), which bind/init/exec callbacks get, has
-  `config()` and the factory only; the whole v2 API has no function that takes a context or an
-  extension handle and returns an instance or a connection, or runs SQL (the C functions taking a
-  context are `context_get_config`, `context_get_factory`, `context_get_file_system`,
-  `context_log`, `arrow_importer_create`, `arrow_exporter_create`), although the header calls the
-  entrypoint's context one "to read and run queries through".
+* **`bridge_scan(dsn, source, nolock, batch_rows, lock_timeout, isolation, readonly)`** (table
+  function). Bind connects (`SourceClient`, R6 session settings), describes the source with
+  `sys.dm_exec_describe_first_result_set` (`core::mssql::scan::plan`), declares one result column per
+  source column (the importer's type mapping; `money` read as DECIMAL(19,4), xml / hierarchyid /
+  geography cast as the importer does) and the `sys.partitions` row count as cardinality. Init starts a
+  `scan::RowStream` (own runtime, one worker thread, bounded channel 4 batches deep) and re-describes:
+  a source that changed since bind is an error naming the column. Exec writes at most 2048 rows per
+  call with `core::duck::write_column` (`Kind::of_type` per declared type; DECIMAL mantissas, UUID,
+  TIMESTAMPTZ written directly). Max threads 1. Query mode runs the text unchanged; the source
+  connection is read-only (`assert_read_only`: `SELECT ... INTO`, `EXEC`, DML are refused).
+* **`bridge_tables(dsn, tables, exclude, schema_map, <scan options>)`**: the importer's catalog,
+  columns schema, name, kind, rows, columns, pk, import_sql (`CREATE TABLE ... AS FROM
+  bridge_scan(...)`). `tables` / `exclude` take names, `schema.name` and `*` / `?` wildcards (the
+  importer's filter, now with globs; the CLI's `--tables` / `--exclude` get them too).
+* **`PRAGMA bridge_import(dsn, tables, exclude, schema_map, keys, keys_after_load, overwrite, views,
+  schema_only, <scan options>)`** (query pragma). Returns a script DuckDB runs in place of the
+  PRAGMA: the importer's own DDL (`import::duck_schema_sql`: schemas, identity sequences, tables with
+  NOT NULL / identity defaults / PK / UNIQUE / FK), one `INSERT INTO t (cols) SELECT cols FROM
+  bridge_scan(...)` per table in FK order, keys after the load, translated views, and a closing
+  `SELECT` of (object, kind, rows, note) rows - the 1.x result shape, with each table's DuckDB count.
+  The DSN (with its password) is part of the script text DuckDB parses.
+* **`PRAGMA bridge_run(sql, dialect, nocase_mode, strict, mssql_math, types, schema_map, reset)`**.
+  Translated statements behind the prelude and the math macros. Two DuckDB 2.0 facts shape it:
+  `integer_division` is applied when a statement is *parsed* and DuckDB parses a pragma's whole script
+  before running it, so the callback sets the prelude on the session through `Context::config()`
+  (before the script is parsed; the script repeats it as `SET SESSION`); and DuckDB refuses a pragma
+  expansion in which a row-returning statement is followed by others ("cannot be served as one
+  result"), so SELECTs before the last statement are left out (a comment marks them) and `reset =
+  true` keeps the last statement's rows in a temp table while the settings are RESET. The prelude
+  settings otherwise stay on the session (1.x reset them).
+* **`COPY ... TO 'mssql://user:pw@host:port/Database/schema.table' (FORMAT duckbridge, CREATE,
+  DROP_EXISTING, KEEP_IDENTITY, TABLE_LOCK, BATCH_ROWS, CHECK_CONSTRAINTS, SORT_BY, STRING_TYPE,
+  TARGET_VERSION, TABLE)`**. Bind checks path, options (unknown ones are errors) and column types
+  (nested types refused with the column name). Init (`v2::copy_open`) drops / creates the table
+  (`bulk::create_table_ddl`: `typemap::map_column_with` + the T-SQL emitter, strings MAX), maps the
+  input columns by name onto `target::read_target_tables`, builds `Converter::for_target`s and opens a
+  `bulk::BulkSink` (writer thread, own connection, `send_loop`, `wire_fixups` checks). Batch exports
+  the `ColumnDataCollection` with duckdb-neo's `ArrowExporter`, imports it as arrow `RecordBatch`es
+  (`core::duck::import_arrow`) and converts with `bulk::rows_from_batch` (batches may run in parallel);
+  flush sends in DuckDB's batch order; finalize commits and compares the rows sent with the rows read.
+  DuckDB's own COPY options (`BATCH_SIZE`, `ORDER_BY`, `PARTITION_BY`, ...) never reach the format;
+  `ORDER_BY` is DuckDB's, so the bulk ORDER hint is `SORT_BY` (the query must produce that order; the
+  server refuses unsorted data). COPY never creates a database.
+* `bridge_import(...)` / `bridge_export(...)` / `bridge_run(...)` table functions stay registered with
+  the 1.x call shapes and fail at bind naming the 2.0 replacement.
 
-So the three table functions are registered with the v1 call shapes (one VARCHAR, any named
-parameters via `NamedVariadic` ANY) and fail at bind with "bridge_import is not available on
-DuckDB 2.0 yet: the v2 C extension API gives an extension no connection to the database that
-loaded it ...". `lib.rs`' pool / parameter / paging code is kept (dead code under `neo`, allowed)
-for when the API grows a way in. A second, smaller gap for that day: `TableFunctionCallbacks::bind`
-(`crates/duckdb-neo/src/table_function/mod.rs:743`) receives `Vec<BindArgument>` (type + value,
-`bind_arguments.rs:19`), not the names; `BindArguments::name` / `index` exist but the callback
-only gets the collected vector (`table_function/mod.rs:94`), so named-parameter lookup (and the
-"given even as NULL" checks of `compat_level` / `bak`) would need duckdb-neo to pass
-`BindArguments` through.
+Table-function bind gets `Vec<BindArgument>` without names: positional arguments, then the named ones
+in declaration order with defaults filled in (an explicit NULL arrives as a NULL value). Checked by a
+probe build and by `bridge_scan` calls with the named arguments permuted (`isolation`, `batch_rows`,
+`lock_timeout` errors come from the right slot); the glue checks the argument count.
 
-What DuckDB / duckdb-neo would need to provide (either is enough):
-`duckdb_v2_context_get_instance` (or `duckdb_v2_extension_get_instance`) returning a retainable
-instance handle, exposed as e.g. `Extension::instance()` / `Context::connect()`; or a context
-query API usable from table-function callbacks. A different design that works today without a
-connection: `bridge_import` as a table function that *produces* one SQL Server table's rows
-(`CREATE TABLE t AS FROM bridge_read('mssql://...', 'dbo.orders')`) and `bridge_export` as a
-COPY function (`COPY t TO 'mssql://...' (FORMAT bridge)`, duckdb-neo `copy_function`), both
-without catalog access, i.e. a different user-facing API.
+Core pieces added for it (backend-neutral, both manifests): `src/mssql/scan.rs`; in `bulk.rs`
+`rows_from_batch` (columnar fast path per column, Arrow display text for dictionaries / nested),
+`BulkSink`, `create_table_ddl`, `TdsRows`, `describe_read_error` public; in `import.rs`
+`duck_schema_sql` / `keys_sql` / `duck_view_sql` (what `create_duck_schema` / `add_keys` /
+`create_duck_views` now run), `select_expr`, `column_to_value` public, glob filters; in
+`core/duck/neo.rs` `Kind` (+ DECIMAL, UUID, TIMESTAMPTZ), `Kind::of_type`, `ChunkMut`, generic
+`write_column`, `import_arrow`.
 
-`scripts/e2e_extension.sh` already takes `DUCK` and `EXT` from the environment, but needs a
-DuckDB CLI and the table functions; `scripts/e2e_extension_neo.py` runs the checks DuckDB 2.0
-allows (footer, LOAD, transpile, prelude, function list) and asserts that `bridge_run` creating a
-table, `bridge_import` from `mssql://sa:...@localhost:14319/d2m_extsrc` and
-`bridge_export(... create_database := true, database := '_neo_out')` fail with that explanation
-without touching SQL Server (`_neo_out` is checked absent and dropped with sqlcmd if present).
+Fixed on the way (affects the CLI import on both backends): `import::column_to_value` subtracted the
+`datetimeoffset` offset from a value TDS already sends as UTC, so imported `datetimeoffset` columns
+with a non-zero offset were off by that offset (tiberius' own `DateTime<Utc>` decoder has the same
+bug; its encoder and `DateTime<FixedOffset>` decoder treat the wire value as UTC). The existing e2e
+fixtures only had offset 0.
+
+Verification (scratch script, DuckDB 2.0 wheel + the 2019 container): `bridge_scan` of a 5002-row
+fixture with tinyint..bigint, bit, decimal(18,4)/(38,10), numeric, money, smallmoney, float, real,
+char, varchar, nvarchar(max), varchar(max), nchar, uniqueidentifier, date, time(7), datetime,
+smalldatetime, datetime2(7)/(3), datetimeoffset(7) (offsets -13h..+13h, +14h extreme), binary,
+varbinary(max), xml, NULLs and extremes: every value equal to sqlcmd's canonical rendering, md5 of all
+canonical rows equal; query mode likewise; `PRAGMA bridge_import` of d2m_extsrc: row counts per table
+equal, identity sequence continues at 1001, PK / NOT NULL kept, views run; `PRAGMA bridge_run` with
+`SELECT ... INTO`, UPDATE and a final SELECT; COPY of 100 000 rows x 17 types with `CREATE true`
+(value-by-value + md5 equal) and into an existing table with narrower types (CHECKSUM_AGG equal to SQL
+Server's own CAST of the same data, identity and DEFAULT columns filled); 3 M rows with `SORT_BY` into
+a clustered PK at ~0.95 M rows/s; scan ~1.3-1.7 M rows/s; 88/88 checks (also: empty COPY input with
+CREATE true, the TABLE option, STRING_TYPE, glob filters, and the error cases: bad password / DSN / database /
+table, read-only guard, values that do not fit naming column and row, server constraint errors,
+identity without KEEP_IDENTITY, nested types, unknown options, missing database never created).
 
 ## Makefile / CI
 
@@ -238,7 +282,25 @@ without touching SQL Server (`_neo_out` is checked absent and dropped with sqlcm
 
 ## Open issues
 
-* Extension table functions blocked on the v2 API (above).
+* Extension on 2.0: the functions are a different interface from 1.x (table functions + COPY + pragmas
+  instead of `bridge_import` / `bridge_export` / `bridge_run` table functions). Not available on 2.0:
+  `bridge_export`'s .bak / parquet / postgres / script targets, parallel or split imports (`bridge_scan`
+  is one connection per table, `PRAGMA bridge_import` loads tables one after the other), the import
+  manifest, lock pre-check and fingerprint re-reads of R6 (`bridge_scan` applies the session settings
+  only), `--plan` for COPY (the runlog is never initialised by the extension). They need either a
+  connection from the v2 API (`duckdb_v2_context_get_instance` or a context query API) or the CLI.
+* `PRAGMA bridge_import` / `bridge_tables` put the DSN, password included, into SQL text DuckDB parses
+  (visible in query logs / profiling output).
+* `PRAGMA bridge_run`: only the last statement's rows are returned (earlier SELECTs are skipped); the
+  prelude settings stay on the session unless `reset = true`; translator warnings appear only as
+  comments in the script (`strict = true` turns them into an error; `bridge_transpile` shows them).
+* `bridge_scan` query mode: types tiberius cannot decode (hierarchyid, geography, geometry, sql_variant)
+  must be cast in the query (table mode casts them); `money` in query mode arrives as a float64 from
+  tiberius (exact up to about 9e11), table mode reads it as DECIMAL(19,4).
+* COPY: rows are committed every `BATCH_ROWS` (100 000 by default): a failing COPY leaves the earlier
+  batches in the table, as `export --into-existing` does; nested types (LIST / STRUCT / MAP / UNION)
+  must be converted in the query (`to_json(col)`); with `CREATE true` strings become NVARCHAR(MAX) /
+  VARCHAR(MAX) (nothing is measured before the stream starts).
 * The `lambda_syntax` setting is marked "revert to the deprecated behavior ... before DuckDB's next
   release". When it goes away, switch `catalog.rs`' `x -> ...` to `lambda x: ...` (accepted by
   DuckDB >= 1.3, so by v1 too) and drop `COMPAT_SETTINGS`; users' scripts with arrows will then
@@ -270,9 +332,9 @@ without touching SQL Server (`_neo_out` is checked absent and dropped with sqlcm
    if the v2 extension API becomes stable, `NEO_ABI` -> `C_STRUCT` (check what DuckDB's loader
    expects for v2 entry points).
 4. `extension/src/duckdb_neo.rs`: the `api_version = "v2.0.0"` of the entry point; once the API
-   gives extensions an instance/connection, replace `Unavailable` with the real table functions
-   (mirror `duckdb_v1.rs`: `install_pool` with 64 connections, `Params` over named bind arguments,
-   `RESULT_COLUMNS`, `Paged::next_page`) and drop the `allow(dead_code)` in `lib.rs`.
+   gives extensions an instance/connection, the 1.x table functions can come back next to the
+   function-based ones (mirror `duckdb_v1.rs`: `install_pool` with 64 connections, `Params` over named
+   bind arguments, `RESULT_COLUMNS`, `Paged::next_page`) and the `allow(dead_code)` in `lib.rs` goes.
 5. `src/core/duck/neo.rs`: revisit `COMPAT_SETTINGS` (lambda syntax), the Arrow batch sizes,
    and whether duckdb-neo grew a table appender (replace the collection + INSERT path).
 6. `neo/Cargo.toml` `bundled-neo`: if the release has an extension repository, the cc `bundled`

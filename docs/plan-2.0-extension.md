@@ -165,3 +165,58 @@ more segment.
    manifest otherwise (one extension name, both lines). Then bump the community descriptor.
 2. README: a "DuckDB 2.0" section with the interface above; the 1.x section stays.
 3. `private/decisions-log.md`, memory.
+
+## Implementation notes: what deviated from this plan, and why
+
+Implemented 2026-10-20 as planned (core `src/mssql/scan.rs`, `bulk.rs` additions, glue in
+`extension/src/duckdb_neo.rs`, backend-neutral parts in `extension/src/lib.rs` module `v2`); details
+and verification in docs/handoff-neo.md §"The extension on neo". Differences:
+
+* **PRAGMA arguments are `name = value`.** DuckDB's PRAGMA grammar has no `:=` (parser error), so
+  `PRAGMA bridge_import(dsn, tables = 'dbo.*', keys = true)`. Table functions keep `:=`.
+* **`bridge_run`'s source dialect is `dialect`, not `from`**: `from` is a reserved word in PRAGMA
+  arguments. `types` is the VARCHAR spec (`'col=decimal(18,4)'`), as in 1.x (the plan's
+  `types := false` was a typo); added `reset` (default false).
+* **The prelude is applied by the pragma callback, not only by the script.** DuckDB applies
+  `integer_division` when it parses a statement and parses a pragma's whole script before running
+  it, so `SET SESSION integer_division = true; SELECT 7/2` in one script returns 3.5. The callback sets
+  the prelude through `Context::config()` (session scope) before DuckDB parses the returned script;
+  the script repeats the SETs.
+* **Several statements per pragma work, with one restriction**: DuckDB 2.0 refuses an expansion in
+  which a row-returning statement is followed by others ("A statement that expands into a
+  row-returning statement followed by others cannot be served as one result"). `bridge_run` leaves out
+  SELECTs before the last statement (a comment in the script marks them); `reset = true` stores the
+  last statement's rows in a temp table, RESETs, then selects them. `bridge_import`'s script ends with
+  its summary SELECT, everything before it is DDL / INSERT.
+* **`PRAGMA bridge_import` recreates the importer's DDL** instead of `CREATE TABLE ... AS FROM
+  bridge_scan(...)` + `ALTER TABLE ADD PRIMARY KEY`: the script is the importer's own statements
+  (`import::duck_schema_sql`, factored out of `create_duck_schema`): identity sequences and defaults,
+  NOT NULL, PK / UNIQUE / FK inline (or after the load with `keys_after_load`), then `INSERT INTO t
+  (cols) SELECT cols FROM bridge_scan(..)` per table in FK order, views, and a summary SELECT in the
+  1.x (object, kind, rows, note) shape. `keys = false` drops all constraints. The plan's CTAS form is
+  what `bridge_tables.import_sql` returns.
+* **COPY's ORDER hint option is `SORT_BY`**: `ORDER_BY` is one of DuckDB 2.0's own COPY options (it
+  never reaches the format, and turns the output into a directory write). The option `CREATE` works
+  as written; `CREATE_TABLE` is accepted too. Unknown options are errors.
+* **`RowStream::start` describes the SELECT it streams**, and `scan::plan` is the bind-time resolver
+  (columns, final SELECT, row count); init compares the two descriptions and fails, naming the column,
+  when the source changed between bind and execution. Table mode reads `money` / `smallmoney` as
+  DECIMAL(19,4) / (10,4) (tiberius decodes money as float64).
+* **`rows_from_batch` decides per column**: the columnar fast path for every Arrow type that has one,
+  the Arrow display text (then the string converter) for the others (dictionaries = ENUM), instead of
+  switching the whole batch to the row path; the row path's `value_ref` is backend-private.
+* **`create_table_ddl` returns a `CreatePlan`** (DDL, the SQL Server type of each column, warnings);
+  strings are MAX because COPY cannot measure lengths before the stream starts.
+* **COPY rejects nested types at bind** (LIST / ARRAY / STRUCT / MAP / UNION / VARIANT), naming the
+  column and suggesting `to_json(col)`; the export path's `select_expr` (to_json) cannot run without a
+  connection.
+* **Table filters take globs**: `tables := 'dbo.*'` in the plan's examples needed `*` / `?` in the
+  importer's filter (`import::wanted`), which only matched exact names; the CLI's `--tables` /
+  `--exclude` accept them too now.
+* **Found while testing `bridge_scan` and fixed in core**: `import::column_to_value` shifted
+  `datetimeoffset` values with a non-zero offset by the offset (the TDS value is already UTC). This
+  changes the CLI import's results for such columns (they are now correct).
+* **Found by the 2.0 e2e script and fixed in core**: `datetime` values came back as 1/300-second
+  ticks converted exactly (`.123333`); SQL Server renders those ticks rounded to the millisecond
+  (`.000/.003/.007`), so `column_to_value` now rounds the same way (`.123`). Also a CLI import fix.
+

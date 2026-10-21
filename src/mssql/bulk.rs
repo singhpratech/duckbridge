@@ -6,8 +6,14 @@
 //! hands batches of `TokenRow`s to the async side through a bounded channel. The async side feeds
 //! them to `INSERT BULK`, finalizing and restarting the request every `batch_rows` rows to bound
 //! the server-side transaction. DuckDB reading/conversion and network I/O overlap.
+//!
+//! Callers that get the rows from DuckDB themselves (the DuckDB 2.0 extension's
+//! `COPY ... TO 'mssql://...' (FORMAT duckbridge)`, which receives Arrow batches and has no DuckDB
+//! connection to run a SELECT on) use the same pieces in the other direction: [`rows_from_batch`]
+//! converts one Arrow batch, a [`BulkSink`] owns the connection and the `INSERT BULK` writer, and
+//! [`create_table_ddl`] renders the target table for columns of given DuckDB types.
 use super::convert::Converter;
-use super::MsClient;
+use super::{MsClient, MssqlTarget};
 use anyhow::{anyhow, bail, Context, Result};
 use crate::core::duck::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array, Decimal32Array, Decimal64Array,
@@ -18,7 +24,12 @@ use crate::core::duck::arrow::array::{
 };
 use crate::core::duck::arrow::buffer::NullBuffer;
 use crate::core::duck::arrow::datatypes::{DataType, IntervalUnit, TimeUnit as ArrowUnit};
+use crate::core::duck::arrow::record_batch::RecordBatch;
+use crate::core::duck::arrow::util::display::{ArrayFormatter, FormatOptions};
 use crate::core::duck::{self, Connection, TimeUnit, ValueRef};
+use crate::core::emit::{Emitter, Flavor};
+use crate::core::model::{Column, Conv, Table};
+use crate::core::typemap::{map_column_with, StringMode, StringType, Target};
 use std::fmt;
 use std::time::Instant;
 use tiberius::{ColumnData, MetaDataColumn, SortOrder, SqlBulkCopyOption, SqlBulkCopyOptions, TokenRow, TypeInfo, VarLenType};
@@ -258,7 +269,9 @@ fn fix_row(row: TokenRow<'static>, fix: &[usize]) -> TokenRow<'static> {
     out
 }
 
-fn describe_read_error(e: anyhow::Error, table_ref: &str, columns: &[String], convs: &[Converter]) -> anyhow::Error {
+/// A reader error as the user sees it: a [`ConvertError`] names the table, the column, its target
+/// type and the source row; anything else gets "reading the DuckDB source for <table>" as context.
+pub fn describe_read_error(e: anyhow::Error, table_ref: &str, columns: &[String], convs: &[Converter]) -> anyhow::Error {
     if let Some(ce) = e.downcast_ref::<ConvertError>() {
         let name = columns.get(ce.column).map(String::as_str).unwrap_or("?");
         let ty = convs.get(ce.column).map(|c| c.to_string()).unwrap_or_default();
@@ -530,6 +543,184 @@ pub(crate) fn read_rows(con: &Connection, sql: &str, convs: &[Converter], batch_
     Ok(total)
 }
 
+// ------------------------------------------------------------------------------------------
+// batches from the caller (COPY TO on DuckDB 2.0)
+
+/// One Arrow column without a typed fast path (ENUM dictionaries, LIST, STRUCT, ...): every value
+/// rendered by arrow's display formatter, then converted like a string.
+fn convert_text_column(a: &ArrayRef, conv: &Converter, rows: &mut [TokenRow<'static>], c: usize, first_row: i64) -> Result<()> {
+    let opts = FormatOptions::default();
+    let fmt = ArrayFormatter::try_new(a.as_ref(), &opts).with_context(|| format!("no text form for Arrow type {}", a.data_type()))?;
+    let nulls = a.logical_nulls();
+    for (r, row) in rows.iter_mut().enumerate() {
+        let d = if is_null(nulls.as_ref(), r) { conv.null() } else {
+            conv.convert_str(&fmt.value(r).to_string()).map_err(|e| anyhow::Error::new(ConvertError { column: c, row: first_row + r as i64 + 1, message: format!("{e:#}") }))?
+        };
+        row.push(d);
+    }
+    Ok(())
+}
+
+/// Converted rows, ready for [`BulkSink::send`].
+pub type TdsRows = Vec<TokenRow<'static>>;
+
+/// Convert one Arrow batch (columns in `convs` order) into TDS rows: column by column through the
+/// typed fast path where the Arrow type has one, as text otherwise ([`convert_text_column`]).
+/// `first_row` = rows before this batch, for the 1-based row number of a [`ConvertError`].
+pub fn rows_from_batch(batch: &RecordBatch, convs: &[Converter], first_row: i64) -> Result<TdsRows> {
+    if batch.num_columns() != convs.len() {
+        bail!("the batch has {} columns but {} converters were given", batch.num_columns(), convs.len());
+    }
+    let mut rows: Vec<TokenRow<'static>> = (0..batch.num_rows()).map(|_| TokenRow::with_capacity(convs.len())).collect();
+    for (c, conv) in convs.iter().enumerate() {
+        let a = batch.column(c);
+        if has_fast_path(a.data_type()) { convert_column(a, conv, &mut rows, c, first_row)?; } else { convert_text_column(a, conv, &mut rows, c, first_row)?; }
+    }
+    Ok(rows)
+}
+
+/// An `INSERT BULK` into one table, fed with converted rows by the caller ([`rows_from_batch`]).
+///
+/// [`BulkSink::open`] starts a writer thread with its own runtime and connection (column metadata and
+/// the [`wire_fixups`] checks happen there, before `open` returns); [`BulkSink::send`] hands it rows
+/// through a bounded channel (`prefetch_batches` deep, so conversion and network I/O overlap);
+/// [`BulkSink::finish`] commits the last batch and returns the rows sent. Batches of `batch_rows` rows
+/// are committed as they fill (as with [`bulk_load`]); dropping the sink without `finish` abandons the
+/// open batch (the connection goes away uncommitted). In `--plan` mode nothing is sent.
+pub struct BulkSink {
+    tx: Option<tokio::sync::mpsc::Sender<Msg>>,
+    worker: Option<std::thread::JoinHandle<Result<i64>>>,
+    table_ref: String,
+    label: String,
+    rows: i64,
+    started: Instant,
+}
+
+impl BulkSink {
+    /// Connect to `database` and prepare the bulk insert into `table_ref` (`columns`: target column
+    /// names in the order of the rows' values, one converter each; see [`bulk_load`]).
+    pub fn open(target: &MssqlTarget, database: &str, table_ref: &str, columns: &[String], convs: &[Converter], o: &BulkOptions) -> Result<BulkSink> {
+        if columns.len() != convs.len() {
+            bail!("bulk load into {table_ref}: {} columns but {} converters", columns.len(), convs.len());
+        }
+        let started = Instant::now();
+        let quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+        let order = parse_order_by(o.order_by.as_deref(), columns)?;
+        let hints: Vec<(String, SortOrder)> = order.iter().map(|(i, desc)| (quoted[*i].clone(), if *desc { SortOrder::Descending } else { SortOrder::Ascending })).collect();
+        let mut opts = SqlBulkCopyOptions::empty();
+        if o.keep_identity { opts |= SqlBulkCopyOption::KeepIdentity; }
+        if o.table_lock { opts |= SqlBulkCopyOption::TableLock; }
+        if o.check_constraints { opts |= SqlBulkCopyOption::CheckConstraints; }
+        let label = format!("INSERT BULK {table_ref} ({}){}{} -- source: COPY TO", quoted.join(", "),
+            if o.table_lock { " WITH (TABLOCK)" } else { "" },
+            if hints.is_empty() { String::new() } else { format!(" ORDER ({})", hints.iter().map(|(c, s)| format!("{c} {}", if *s == SortOrder::Descending { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(", ")) });
+        let mut sink = BulkSink { tx: None, worker: None, table_ref: table_ref.to_string(), label, rows: 0, started };
+        if crate::core::runlog::planning() { return Ok(sink); }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Msg>(o.prefetch_batches.max(1));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+        let (target, database, table_ref, columns, convs) = (target.clone(), database.to_string(), table_ref.to_string(), columns.to_vec(), convs.to_vec());
+        let (keep_identity, batch_rows) = (o.keep_identity, o.batch_rows.max(1));
+        let worker = std::thread::Builder::new().name("duckbridge-bulk-writer".into()).spawn(move || -> Result<i64> {
+            let rt = super::runtime()?;
+            rt.block_on(async move {
+                let col_refs: Vec<&str> = quoted.iter().map(String::as_str).collect();
+                let setup = async {
+                    let mut c = target.connect(&database).await.with_context(|| format!("connecting to {database} on {}:{}", target.host, target.port))?;
+                    let meta = c.column_metadata(&table_ref, &col_refs).await.with_context(|| format!("reading the column metadata of {table_ref}"))?;
+                    let fixups = wire_fixups(&meta, &table_ref, &columns, &convs, keep_identity)?;
+                    Ok::<_, anyhow::Error>((c, fixups))
+                }.await;
+                let (mut client, fixups) = match setup {
+                    Ok(x) => { let _ = ready_tx.send(Ok(())); x }
+                    Err(e) => { let msg = format!("{e:#}"); let _ = ready_tx.send(Err(e)); bail!("{msg}") }
+                };
+                let hint_refs: Vec<(&str, SortOrder)> = hints.iter().map(|(c, s)| (c.as_str(), *s)).collect();
+                send_loop(&mut client, rx, &table_ref, &col_refs, opts, &hint_refs, batch_rows, &fixups, &|_| {}).await
+            })
+        }).context("starting the bulk writer thread")?;
+        sink.worker = Some(worker);
+        match ready_rx.recv() {
+            Ok(Ok(())) => { sink.tx = Some(tx); Ok(sink) }
+            Ok(Err(e)) => { let _ = sink.worker.take().map(|h| h.join()); Err(e) }
+            Err(_) => Err(sink.worker_error()),
+        }
+    }
+
+    /// The writer's error after it stopped (the channel is closed).
+    fn worker_error(&mut self) -> anyhow::Error {
+        self.tx = None;
+        match self.worker.take().map(|h| h.join()) {
+            Some(Ok(Err(e))) => e,
+            Some(Err(_)) => anyhow!("the bulk writer for {} panicked", self.table_ref),
+            _ => anyhow!("the bulk writer for {} stopped", self.table_ref),
+        }
+    }
+
+    /// Queue `rows` (blocks while `prefetch_batches` batches are waiting). A failed writer's error
+    /// (constraint violation, lost connection, ...) is returned by the next `send` or by `finish`.
+    pub fn send(&mut self, rows: TdsRows) -> Result<()> {
+        if rows.is_empty() || self.worker.is_none() { return Ok(()); }
+        let n = rows.len() as i64;
+        let Some(tx) = self.tx.as_ref() else { return Err(self.worker_error()) };
+        if tx.blocking_send(Msg::Rows(rows)).is_err() { return Err(self.worker_error()); }
+        self.rows += n;
+        Ok(())
+    }
+
+    /// Commit the last batch and return the rows the server received (0 in `--plan` mode).
+    pub fn finish(mut self) -> Result<i64> {
+        if self.worker.is_none() {
+            crate::core::runlog::stmt("target", &self.table_ref, &self.label, 0, self.started);
+            return Ok(0);
+        }
+        let done = self.tx.as_ref().map(|tx| tx.blocking_send(Msg::Done(self.rows)).is_ok()).unwrap_or(false);
+        if !done { return Err(self.worker_error()); }
+        self.tx = None;
+        let sent = match self.worker.take().map(|h| h.join()) {
+            Some(Ok(r)) => r?,
+            _ => bail!("the bulk writer for {} panicked", self.table_ref),
+        };
+        if sent != self.rows { bail!("bulk load into {}: {} rows queued but {sent} sent", self.table_ref, self.rows); }
+        crate::core::runlog::stmt("target", &self.table_ref, &self.label, sent, self.started);
+        Ok(sent)
+    }
+}
+
+impl Drop for BulkSink {
+    /// Closing the channel without `Done` makes the writer stop without committing its open batch.
+    fn drop(&mut self) { self.tx = None; }
+}
+
+/// The SQL Server table for columns of the given DuckDB types (`COPY ... (CREATE true)`): the DDL to
+/// run (the schema when it is not `dbo`, then the table) and each column's SQL Server type.
+#[derive(Debug, Clone)]
+pub struct CreatePlan {
+    pub ddl: Vec<String>,
+    pub sql_types: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Map `columns` (name, DuckDB type text) with the exporter's type mapping
+/// (`typemap::map_column_with`; strings are MAX: nothing is measured before the copy starts, so
+/// `string_type` Auto means NVARCHAR) and render them with the T-SQL emitter. Columns are nullable.
+pub fn create_table_ddl(schema: &str, table: &str, columns: &[(String, String)], string_type: StringType) -> CreatePlan {
+    let mut cols: Vec<Column> = columns.iter().map(|(name, duck_type)| {
+        let mut c = Column { name: name.clone(), duck_type: duck_type.clone(), nullable: true, default: None, comment: None, sql_type: String::new(), select_expr: String::new(),
+            conv: Conv::Identity, max_len: None, identity: None, enum_values: None, warnings: vec![] };
+        map_column_with(&mut c, false, StringMode::Max, Target::Mssql, string_type, None, None);
+        c
+    }).collect();
+    let warnings = cols.iter_mut().flat_map(|c| { let n = c.name.clone(); std::mem::take(&mut c.warnings).into_iter().map(move |w| format!("{schema}.{table}.{n}: {w}")) }).collect();
+    let sql_types = cols.iter().map(|c| c.sql_type.clone()).collect();
+    let mut t = Table { schema: schema.to_string(), name: table.to_string(), columns: cols, constraints: vec![], indexes: vec![], row_count: 0, comment: None };
+    let e = Emitter::new(Flavor::Mssql, Default::default());
+    let mut ddl = vec![];
+    if !schema.eq_ignore_ascii_case("dbo") { ddl.push(e.create_schema(schema)); }
+    ddl.push(e.create_table(&mut t));
+    CreatePlan { ddl, sql_types, warnings }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +813,51 @@ mod tests {
         assert!(e.to_string().contains("sink full"));
         // column count mismatch
         assert!(read_rows(&con, "SELECT 1", &cv, 10, &mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn bulk_rows_from_batch_mixed_fast_and_text_columns() {
+        let con = duck::open_in_memory().unwrap();
+        duck::exec(&con, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')").unwrap();
+        let sql = "SELECT i::BIGINT AS id, CASE WHEN i % 3 = 0 THEN NULL ELSE 'n' || i END AS name, (['sad', 'ok', 'happy'])[i % 3 + 1]::mood AS m,
+                   [i, i + 1] AS l, CAST(i AS DECIMAL(9,2)) AS d FROM range(5) r(i)";
+        let batches: Vec<RecordBatch> = duck::arrow_batches(&con, sql).unwrap().collect::<Result<_>>().unwrap();
+        // ENUM (dictionary) and LIST have no columnar fast path: they go through their text form
+        assert!(!has_fast_path(batches[0].column(2).data_type()) && !has_fast_path(batches[0].column(3).data_type()));
+        let f = |t: &str| Converter::for_sql_type(t, "").unwrap();
+        let convs = vec![Converter::BigInt, f("NVARCHAR(10)"), f("VARCHAR(5)"), Converter::Text, f("DECIMAL(9,2)")];
+        let mut all: Vec<TokenRow<'static>> = vec![];
+        for b in &batches { let first = all.len() as i64; all.extend(rows_from_batch(b, &convs, first).unwrap()); }
+        assert_eq!(all.len(), 5);
+        assert!(matches!(all[0].get(0), Some(ColumnData::I64(Some(0)))));
+        assert!(matches!(all[0].get(1), Some(ColumnData::String(None))));
+        match all[2].get(1) { Some(ColumnData::String(Some(s))) => assert_eq!(s, "n2"), o => panic!("{o:?}") }
+        match all[2].get(2) { Some(ColumnData::String(Some(s))) => assert_eq!(s, "happy"), o => panic!("{o:?}") }
+        match all[2].get(3) { Some(ColumnData::String(Some(s))) => assert_eq!(s, "[2, 3]"), o => panic!("{o:?}") }
+        match all[4].get(4) { Some(ColumnData::Numeric(Some(x))) => { assert_eq!((x.value(), x.scale()), (400, 2)) } o => panic!("{o:?}") }
+        // a value that does not fit: the error names the column index and the row (first_row + 1-based)
+        let tight = vec![Converter::BigInt, f("NVARCHAR(10)"), f("VARCHAR(2)"), Converter::Text, f("DECIMAL(9,2)")];
+        let e = rows_from_batch(&batches[0], &tight, 10).unwrap_err();
+        let ce = e.downcast_ref::<ConvertError>().expect("a ConvertError");
+        assert_eq!((ce.column, ce.row), (2, 11));
+        let msg = describe_read_error(e, "[dbo].[t]", &["id".into(), "name".into(), "m".into(), "l".into(), "d".into()], &tight).to_string();
+        assert!(msg.contains("column m (varchar(2))") && msg.contains("row 11"), "{msg}");
+        assert!(rows_from_batch(&batches[0], &convs[..2], 0).unwrap_err().to_string().contains("5 columns but 2 converters"));
+    }
+
+    #[test]
+    fn bulk_create_table_ddl() {
+        let cols: Vec<(String, String)> = [("id", "BIGINT"), ("name", "VARCHAR"), ("amt", "DECIMAL(18,2)"), ("g", "UUID"), ("ts", "TIMESTAMP WITH TIME ZONE"), ("h", "HUGEINT"), ("b", "BLOB")]
+            .iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let p = create_table_ddl("sales", "kpi", &cols, StringType::Varchar);
+        assert_eq!(p.sql_types, ["BIGINT", "VARCHAR(MAX)", "DECIMAL(18,2)", "UNIQUEIDENTIFIER", "DATETIMEOFFSET(7)", "DECIMAL(38,0)", "VARBINARY(MAX)"]);
+        assert_eq!(p.ddl.len(), 2);
+        assert!(p.ddl[0].contains("CREATE SCHEMA [sales]"), "{:?}", p.ddl);
+        assert!(p.ddl[1].starts_with("CREATE TABLE [sales].[kpi] (") && p.ddl[1].contains("[id] BIGINT NULL") && p.ddl[1].contains("[ts] DATETIMEOFFSET(7) NULL"), "{}", p.ddl[1]);
+        assert!(p.warnings.iter().any(|w| w.starts_with("sales.kpi.h:") && w.contains("DECIMAL(38,0)")), "{:?}", p.warnings);
+        let p = create_table_ddl("dbo", "t", &cols[..2], StringType::Auto);
+        assert_eq!((p.ddl.len(), p.sql_types[1].as_str()), (1, "NVARCHAR(MAX)"));
+        for (t, c) in p.sql_types.iter().zip(&cols) { Converter::for_sql_type(t, &c.1).unwrap(); }
     }
 
     #[test]
