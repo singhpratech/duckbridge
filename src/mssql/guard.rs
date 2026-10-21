@@ -195,7 +195,9 @@ mod tests {
             }
         }
         let mut hits = vec![];
-        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hits);
+        // neo/Cargo.toml builds these same sources from ../src
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        walk(&if root.join("src").is_dir() { root.join("src") } else { root.join("../src") }, &mut hits);
         assert!(hits.is_empty(), "database-level statements outside guard.rs:\n{}", hits.join("\n"));
     }
 }

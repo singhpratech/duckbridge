@@ -1,0 +1,98 @@
+# DuckBridge on the duckdb-neo backend (DuckDB 2.0, v2 C API).
+#
+# Same sources as the root package (../src, ../tests); only the DuckDB backend differs. It is a
+# separate manifest because duckdb-rs' `libduckdb-sys` declares `links = "duckdb"`: the crates.io
+# 1.x release the root package uses (duckdb 1.10506 -> libduckdb-sys =1.10506.1) and the git
+# release duckdb-neo needs (libduckdb-sys 1.20000.0) cannot both be in one dependency graph, even
+# as optional dependencies. See docs/handoff-neo.md.
+#
+#   cargo build --release --manifest-path neo/Cargo.toml                 # bundled DuckDB 2.0 (default)
+#   cargo test  --release --manifest-path neo/Cargo.toml --no-default-features --features duckdb-neo,bundled-neo
+#   cargo build --release --manifest-path neo/Cargo.toml --no-default-features --features duckdb-neo,download-neo
+[package]
+name = "duckbridge"
+version = "0.1.1"
+edition = "2021"
+publish = false
+description = "DuckBridge on DuckDB 2.0 (duckdb-neo backend)"
+license = "MIT"
+autobins = false
+autotests = false
+autobenches = false
+autoexamples = false
+
+# Separate workspace (see above).
+[workspace]
+
+[lib]
+name = "duckbridge"
+path = "../src/lib.rs"
+
+[[bin]]
+name = "duckbridge"
+path = "../src/main.rs"
+required-features = ["duckdb-neo"]
+
+[[test]]
+name = "transpile_tests"
+path = "../tests/transpile_tests.rs"
+
+[features]
+default = ["duckdb-neo", "bundled-neo"]
+# DuckDB backend: duckdb-neo = DuckDB's Rust bindings for the v2 C API (DuckDB 2.0). Arrow comes
+# in through the Arrow C data interface, so the arrow crate is ours (same major as duckdb-rs 1.x).
+duckdb-neo = ["dep:duckdb-neo", "dep:arrow"]
+# How the CLI gets DuckDB: compiled in (bundled-neo: DuckDB's CMake build with parquet, json and icu
+# linked in statically - DuckDB 2.0 alpha builds have no extension repository to autoload them
+# from; it needs cmake and the duckdb-sources submodule cargo checks out) or the prebuilt shared
+# library of the pinned build, downloaded at build time (download-neo; needs LD_LIBRARY_PATH /
+# DYLD_LIBRARY_PATH at run time outside `cargo run`/`cargo test`).
+bundled-neo = ["duckdb-neo", "duckdb-neo/bundled-cmake-icu", "duckdb-neo/bundled-json"]
+download-neo = ["duckdb-neo", "duckdb-neo/buildtime-download"]
+# The duckdb-v1 backend builds from the root Cargo.toml only; naming it here is a compile error.
+duckdb-v1 = []
+
+[dependencies]
+# duckdb-rs main as of 2026-10-20 ("Neo extensions", #910); pins DuckDB v2.0.0-alpha49003 (b32b1368b8).
+duckdb-neo = { git = "https://github.com/duckdb/duckdb-rs", rev = "c4936cea71f313deb4375fbc5b47ea9e17214236", default-features = false, optional = true }
+arrow = { version = "58", default-features = false, features = ["ffi"], optional = true }
+tiberius = { version = "0.13", default-features = false, features = ["rustls", "chrono", "rust_decimal", "tds73"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+chrono = "0.4"
+uuid = "1"
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["rustls"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+percent-encoding = "2"
+indicatif = "0.17"
+regex = "1"
+tempfile = "3"
+# <0.7.18: newer postgres-protocol wants hmac/sha2 0.11 final, while tiberius' sspi-rs pins their release candidates
+tokio-postgres = { version = "0.7, <0.7.18", features = ["with-chrono-0_4", "with-uuid-1"] }
+num_cpus = "1"
+bytes = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# Windows authentication: process identity via SSPI on Windows, explicit DOMAIN\user NTLM
+# credentials everywhere through the pure-Rust sspi crate (no system Kerberos libraries needed).
+[target.'cfg(windows)'.dependencies]
+tiberius = { version = "0.13", default-features = false, features = ["winauth"] }
+[target.'cfg(unix)'.dependencies]
+tiberius = { version = "0.13", default-features = false, features = ["sspi-rs"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

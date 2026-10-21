@@ -26,8 +26,14 @@ required-features = ["bundled"]
 default = ["duckdb-v1", "bundled"]
 bundled = ["duckdb-v1", "duckdb/bundled"]
 # DuckDB backend (exactly one is needed; see src/core/duck.rs and docs/handoff-duck-layer.md):
-# duckdb-v1 = duckdb-rs on the DuckDB 1.x C API. A `duckdb-neo` backend (DuckDB 2.0) goes next to it.
+# duckdb-v1 = duckdb-rs on the DuckDB 1.x C API. The `duckdb-neo` backend (DuckDB 2.0) builds from
+# neo/Cargo.toml (same sources): its libduckdb-sys cannot share a dependency graph with this one
+# (`links = "duckdb"`), see docs/handoff-neo.md.
 duckdb-v1 = ["dep:duckdb"]
+
+[lints.rust]
+# `duckdb-neo` is a feature of neo/Cargo.toml, which compiles these same sources.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("duckdb-neo"))'] }
 
 [dependencies]
 duckdb = { version = "1.10506", default-features = false, features = ["chrono", "uuid", "serde_json"], optional = true }

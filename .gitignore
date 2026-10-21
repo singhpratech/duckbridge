@@ -6,3 +6,5 @@ tests/fixtures/sample.duckdb
 *.bak
 # internal strategy notes and discussion log, never published
 /private/
+/neo/target
+/extension/neo/target
