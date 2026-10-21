@@ -111,12 +111,15 @@ jobs:
           workspaces: extension
       - name: Build extension
         working-directory: extension
+        # stable v1 C API table of 1.5.6: the binary loads on DuckDB 1.5.6 and 2.x (see extension/Makefile)
+        env:
+          DUCKDB_EXTENSION_MIN_DUCKDB_VERSION: v1.5.6
         run: cargo build --release --target ${{ matrix.target }}
       - name: Append DuckDB metadata footer
         working-directory: extension
         run: |
           mkdir -p build
-          ./pack.sh target/${{ matrix.target }}/release/${{ matrix.lib }} build/duckbridge.duckdb_extension ${{ matrix.platform }} v1.5.6 v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ./pack.sh target/${{ matrix.target }}/release/${{ matrix.lib }} build/duckbridge.duckdb_extension ${{ matrix.platform }} v1.5.6 v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) C_STRUCT
           # DuckDB derives the entry-point symbol from the file name, so the member must stay
           # duckbridge.duckdb_extension; the archive name carries the platform.
           PY=python3; command -v python3 >/dev/null || PY=python
