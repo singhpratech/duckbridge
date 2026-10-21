@@ -1,0 +1,43 @@
+# The DuckBridge extension on the duckdb-neo backend (DuckDB 2.0, v2 C extension API).
+#
+# Same sources as extension/Cargo.toml (../src); `neo` selects src/duckdb_neo.rs instead of
+# src/duckdb_v1.rs. A separate manifest because duckdb-rs' libduckdb-sys declares
+# `links = "duckdb"`: the 1.x crate extension/Cargo.toml uses and the git release duckdb-neo needs
+# cannot share one dependency graph. See docs/handoff-neo.md.
+#
+#   cd extension && make release-neo      # -> build/duckbridge-neo/duckbridge.duckdb_extension
+[package]
+name = "duckbridge_ext"
+version = "0.1.1"
+edition = "2021"
+description = "DuckBridge as a loadable DuckDB 2.0 extension (duckdb-neo backend)"
+license = "MIT"
+publish = false
+autobins = false
+autotests = false
+autobenches = false
+autoexamples = false
+
+[lib]
+path = "../src/lib.rs"
+crate-type = ["cdylib"]
+
+# Separate workspace: the extension must not bundle DuckDB.
+[workspace]
+
+[features]
+default = ["neo"]
+neo = []
+
+[dependencies]
+# duckdb-rs main as of 2026-10-20 ("Neo extensions", #910); pins DuckDB v2.0.0-alpha49003 (b32b1368b8).
+duckdb-neo = { git = "https://github.com/duckdb/duckdb-rs", rev = "c4936cea71f313deb4375fbc5b47ea9e17214236", default-features = false, features = ["build-extension"] }
+duckdb-loadable-macros = { git = "https://github.com/duckdb/duckdb-rs", rev = "c4936cea71f313deb4375fbc5b47ea9e17214236", features = ["neo"] }
+duckbridge = { path = "../../neo", default-features = false, features = ["duckdb-neo"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

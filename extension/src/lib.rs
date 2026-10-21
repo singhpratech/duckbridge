@@ -23,6 +23,13 @@
 //!   result paging and the text of the scalar functions.
 //! * `duckdb_v1.rs`: the duckdb-rs glue (DuckDB 1.x C API): `VTab` / `VScalar` impls, vector
 //!   reads/writes, the `Params` impl over `BindInfo`, and the `duckbridge_init_c_api` entry point.
+//! * `duckdb_neo.rs` (feature `neo`, built from extension/neo/Cargo.toml): the duckdb-neo glue
+//!   (DuckDB 2.0 v2 C API). Only the scalar functions work there so far; see that file and
+//!   docs/handoff-neo.md for why the table functions cannot get a connection yet.
+
+// With the `neo` glue only the scalar functions are wired up (no connection on DuckDB 2.0 yet),
+// so the pool and the table-function plumbing below are unused there.
+#![cfg_attr(feature = "neo", allow(dead_code))]
 
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,7 +40,10 @@ use duckbridge::api::{self, Row};
 use duckbridge::core::duck::{self, Connection};
 use duckbridge::transpile::{self, Dialect};
 
+#[cfg(not(feature = "neo"))]
 mod duckdb_v1;
+#[cfg(feature = "neo")]
+mod duckdb_neo;
 
 /// Rows per output chunk (DuckDB's standard vector size).
 const VECTOR_SIZE: usize = 2048;

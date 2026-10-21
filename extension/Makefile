@@ -2,6 +2,8 @@
 #   make release            -> build/duckbridge.duckdb_extension for this machine
 #   make test               -> ../scripts/e2e_extension.sh (needs the local SQL Server container)
 #   DUCKDB_PLATFORM=osx_arm64 TARGET=aarch64-apple-darwin make release   (cross build)
+#   make release-neo        -> build/neo/duckbridge.duckdb_extension for DuckDB 2.0 (duckdb-neo,
+#                              extension/neo/Cargo.toml; see docs/handoff-neo.md)
 #
 # The extension uses DuckDB's C extension API through duckdb-rs, which needs the "unstable"
 # C struct, so each binary is pinned to the exact DuckDB version below.
@@ -9,6 +11,10 @@ EXTENSION_NAME   := duckbridge
 DUCKDB_VERSION   := v1.5.6
 EXT_VERSION      := v$(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 ABI              := C_STRUCT_UNSTABLE
+# DuckDB 2.0 (duckdb-neo): the build duckdb-neo pins (libduckdb-sys/.duckdb-release); the v2 C
+# extension API is unstable too, so the footer pins this exact version string.
+NEO_DUCKDB_VERSION ?= v2.0.0-alpha49003
+NEO_ABI            ?= C_STRUCT_UNSTABLE
 
 UNAME_S := $(shell uname -s 2>/dev/null)
 UNAME_M := $(shell uname -m 2>/dev/null)
@@ -45,7 +51,7 @@ endif
 LIB := $(TARGET_DIR)/release/$(LIB_PREFIX)duckbridge_ext.$(LIB_EXT)
 OUT := build/$(EXTENSION_NAME).duckdb_extension
 
-.PHONY: all release debug test clean
+.PHONY: all release release-neo debug test clean
 
 all: release
 
@@ -53,6 +59,11 @@ release:
 	cargo build --release $(TARGET_FLAG)
 	mkdir -p build
 	./pack.sh $(LIB) $(OUT) $(DUCKDB_PLATFORM) $(DUCKDB_VERSION) $(EXT_VERSION) $(ABI)
+
+release-neo:
+	cd neo && cargo build --release $(TARGET_FLAG)
+	mkdir -p build/neo
+	./pack.sh neo/$(LIB) build/neo/$(EXTENSION_NAME).duckdb_extension $(DUCKDB_PLATFORM) $(NEO_DUCKDB_VERSION) $(EXT_VERSION) $(NEO_ABI)
 
 debug:
 	cargo build $(TARGET_FLAG)
@@ -64,4 +75,5 @@ test: release
 
 clean:
 	cargo clean
+	cd neo && cargo clean
 	rm -rf build

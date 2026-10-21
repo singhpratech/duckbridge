@@ -12,6 +12,10 @@ crate-type = ["cdylib"]
 # Separate workspace: the CLI bundles DuckDB, the extension must not.
 [workspace]
 
+[lints.rust]
+# `neo` is a feature of extension/neo/Cargo.toml, which compiles these same sources.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("neo"))'] }
+
 [dependencies]
 duckdb = { version = "1.10506", default-features = false, features = ["loadable-extension", "vscalar", "chrono", "uuid", "serde_json"] }
 duckbridge = { path = "..", default-features = false, features = ["duckdb-v1"] }
