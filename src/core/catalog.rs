@@ -80,7 +80,7 @@ pub fn read_catalog(con: &Connection, source: &str, o: &CatalogOptions) -> Resul
     {
         let rows: Vec<(String, String)> = duck::query_rows_with(con, "select schema_name, type_name from duckdb_types() where logical_type='ENUM' and not internal and database_name=?", &[&db], |r| Ok((r.get(0)?, r.get(1)?)))?;
         for (sch, tn) in rows {
-            let sql = format!("select list_aggregate(list_transform(enum_range(NULL::{}.{}), x -> '''' || replace(x, '''', '''''') || ''''), 'string_agg', ', ')", quote_duck(&sch), quote_duck(&tn));
+            let sql = format!("select list_aggregate(list_transform(enum_range(NULL::{}.{}), lambda x: '''' || replace(x, '''', '''''') || ''''), 'string_agg', ', ')", quote_duck(&sch), quote_duck(&tn));
             let vals: String = duck::query_scalar(con, &sql)?;
             let e = format!("ENUM({vals})");
             enums.insert(tn.clone(), e.clone());

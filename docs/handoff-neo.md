@@ -301,10 +301,8 @@ identity without KEEP_IDENTITY, nested types, unknown options, missing database 
   batches in the table, as `export --into-existing` does; nested types (LIST / STRUCT / MAP / UNION)
   must be converted in the query (`to_json(col)`); with `CREATE true` strings become NVARCHAR(MAX) /
   VARCHAR(MAX) (nothing is measured before the stream starts).
-* The `lambda_syntax` setting is marked "revert to the deprecated behavior ... before DuckDB's next
-  release". When it goes away, switch `catalog.rs`' `x -> ...` to `lambda x: ...` (accepted by
-  DuckDB >= 1.3, so by v1 too) and drop `COMPAT_SETTINGS`; users' scripts with arrows will then
-  fail on 2.0 regardless.
+* `lambda_syntax` compatibility setting removed (2026-10-21): catalog.rs uses `lambda x: ...` (DuckDB >= 1.3,
+  so v1 too); users' scripts with `x -> expr` fail on 2.0 as they would on plain DuckDB 2.0.
 * Appender: values of mixed variants in one column (never produced by `import.rs`) go in as text;
   LIST / STRUCT / MAP / UNION `Value`s are rendered as debug text (the v1 appender rejects most of
   them too).

@@ -27,7 +27,6 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{anyhow, bail, Context as _, Result};
 use duckdb_neo as neo;
 use neo::column_data_collection::ColumnDataCollection;
-use neo::connection::SettingScope;
 use neo::data_chunk::DataChunk;
 use neo::environment::{Environment, StorageLocation};
 use neo::instance::{AttachBuilder, Instance};
@@ -57,9 +56,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, IntervalUnit, Schema, SchemaRef, TimeUnit as ArrowUnit, UInt16Type, UInt32Type, UInt8Type};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::record_batch::RecordBatch;
-
-/// Instance settings that keep DuckDB 2.0 accepting what DuckBridge sends DuckDB 1.x.
-const COMPAT_SETTINGS: &[(&str, &str)] = &[("lambda_syntax", "ENABLE_SINGLE_ARROW")];
 
 /// Rows per Arrow array of a streaming query ([`stream`]); DuckDB's vector size, as duckdb-rs
 /// 1.x hands out one array per data chunk.
@@ -109,9 +105,6 @@ impl fmt::Debug for Connection {
 
 impl Connection {
     fn of(instance: Instance) -> Result<Connection> {
-        // DuckDB 2.0 rejects the `x -> expr` lambda syntax 1.x accepts (only `lambda x: expr`);
-        // DuckBridge's own SQL (catalog.rs ENUM expansion) and users' scripts still use it.
-        for (k, v) in COMPAT_SETTINGS { instance.config().d()?.set_text(k, v, SettingScope::Global).d()?; }
         let instance = Arc::new(instance);
         Ok(Connection { con: instance.connect().d()?, instance })
     }
