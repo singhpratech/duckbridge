@@ -24,7 +24,7 @@ Commits (on top of step 1):
 | `cargo test --release` (lib + translator) | 102 + 81 pass | 104 + 81 pass |
 | `scripts/e2e_mssql.sh` | 45/45 | 45/45 |
 | `scripts/e2e_large_load.sh` | 118/118 | 118/118 |
-| extension | `make release` + `e2e_extension.sh` 33/33 | `make release-neo` + `e2e_extension_neo.py`: 138 pass, 1 fail (`datetime` fraction, see below the table) |
+| extension | `make release` + `e2e_extension.sh` 33/33 | `make release-neo` + `e2e_extension_neo.py`: 139 pass, 0 fail |
 
 The one failing `e2e_extension_neo.py` check: `bridge_scan` of a `datetime` column returns the
 fraction in thirds of a millisecond (`10:30:15.123333` for SQL Server's `10:30:15.123`), so the value
