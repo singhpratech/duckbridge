@@ -158,10 +158,11 @@ missed). No call site outside `duck/` changed.
 * **Errors**: DuckDB's message only; duckdb-neo's `Display` appends ` (code N)`, which is dropped
   so texts match v1 (`Query returned no rows` for `query_one` without a row, as duckdb-rs).
 * **DuckDB 2.0 behaviour**: 2.0 rejects the deprecated `x -> expr` lambda syntax
-  ("Deprecated lambda arrow (->) detected"), which `catalog.rs`' ENUM expansion and users' scripts
-  use. Every neo instance gets `lambda_syntax = 'ENABLE_SINGLE_ARROW'` (`COMPAT_SETTINGS` in
-  `neo.rs`), so both backends send the same SQL. Nothing else in the 45 + 118 e2e checks needed a
-  change.
+  ("Deprecated lambda arrow (->) detected"). `catalog.rs`' ENUM expansion, the one place DuckBridge
+  used it, now writes `lambda x: expr` (accepted by DuckDB >= 1.3, so by v1 too); the interim
+  `lambda_syntax = 'ENABLE_SINGLE_ARROW'` instance setting was removed on 2026-10-21. Users' scripts
+  with arrows fail on 2.0 as they do on plain DuckDB 2.0. Nothing else in the 45 + 118 e2e checks
+  needed a change.
 * `mssql/guard.rs`' source-scan test now also finds `../src` when built from `neo/`.
 
 ## The extension on neo (`extension/src/duckdb_neo.rs`)
