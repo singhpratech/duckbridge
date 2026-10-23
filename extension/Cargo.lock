@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "duckbridge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "duckbridge_ext"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "duckbridge",

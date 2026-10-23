@@ -11,7 +11,7 @@
 #   cargo build --release --manifest-path neo/Cargo.toml --no-default-features --features duckdb-neo,download-neo
 [package]
 name = "duckbridge"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 publish = false
 description = "DuckBridge on DuckDB 2.0 (duckdb-neo backend)"

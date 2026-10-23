@@ -8,7 +8,7 @@
 #   cd extension && make release-neo      # -> build/duckbridge-neo/duckbridge.duckdb_extension
 [package]
 name = "duckbridge_ext"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "DuckBridge as a loadable DuckDB 2.0 extension (duckdb-neo backend)"
 license = "MIT"

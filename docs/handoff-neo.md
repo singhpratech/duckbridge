@@ -19,17 +19,17 @@ Commits (on top of step 1):
 
 ## Results
 
-| | duckdb-v1 (default) | duckdb-neo (DuckDB v2.0.0-alpha49003) |
+| | duckdb-v1 (default) | duckdb-neo (DuckDB 2.0.0) |
 |---|---|---|
-| `cargo test --release` (lib + translator) | 102 + 81 pass | 104 + 81 pass |
+| `cargo test --release` (lib + translator) | 103 + 81 pass | 105 + 81 pass |
 | `scripts/e2e_mssql.sh` | 45/45 | 45/45 |
 | `scripts/e2e_large_load.sh` | 118/118 | 118/118 |
-| extension | `make release` + `e2e_extension.sh` 33/33 | `make release-neo` + `e2e_extension_neo.py`: 139 pass, 0 fail |
+| extension | `make release` + `e2e_extension.sh` 33/33 (DuckDB 1.5.6 CLI and the 2.0.0 Python wheel, same binary) | `make release-neo` + `e2e_extension_neo.py` on the `duckdb==2.0.0` wheel: 139 pass, 0 fail |
 
-The one failing `e2e_extension_neo.py` check: `bridge_scan` of a `datetime` column returns the
-fraction in thirds of a millisecond (`10:30:15.123333` for SQL Server's `10:30:15.123`), so the value
-differs from SQL Server's own rendering; the other
-23 type columns, every COPY round trip and all error cases pass.
+The neo CLI writes DuckDB 2.0 storage (file version 69), which the 1.5.6 CLI cannot open, so the CLI
+suites on the neo binary need a 2.0 reader: `BIN=neo/target/release/duckbridge DUCK=<wrapper around
+scripts/duckdb_py_cli.py in a duckdb==2.0.0 venv> scripts/e2e_mssql.sh`. With the 1.5.6 CLI as
+`DUCK`, 14 of the 45 and 3 of the 118 checks fail for that reason alone.
 
 neo was also run with `download-neo` (prebuilt `libduckdb.so` of the pinned build, which includes
 ICU): `cargo test` 94 + 81 pass. Streaming benchmark (`cargo test --release --lib -- --ignored
@@ -266,7 +266,8 @@ identity without KEEP_IDENTITY, nested types, unknown options, missing database 
 ## Makefile / CI
 
 * `extension/Makefile`: `make release-neo` builds `extension/neo` and packs
-  `build/neo/duckbridge.duckdb_extension` with `NEO_DUCKDB_VERSION ?= v2.0.0-alpha49003` and
+  `build/neo/duckbridge.duckdb_extension` with `NEO_DUCKDB_VERSION ?= v2.0.0` (the 2.0.0 release; the
+  alpha the crate pins has the identical v2 API table, so the binary loads on the release) and
   `NEO_ABI ?= C_STRUCT_UNSTABLE` (the footer's duckdb version must equal the engine's
   `PRAGMA version` string exactly, else the engine needs `allow_extensions_metadata_mismatch`).
   `make clean` also cleans `neo/`.

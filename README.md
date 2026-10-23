@@ -31,6 +31,19 @@ One static binary (Linux, macOS, Windows). No ODBC driver, no Python, no `bcp` n
 Input files and outputs accept local paths or `s3://bucket/key`, `az://container/blob`, `gs://bucket/key`.
 Cloud clients are built in (SigV4 / Azure Shared Key or SAS), credentials come from the usual environment variables.
 
+## What changed in 0.1.2
+
+0.1.2 is a correctness and DuckDB 2.0 release; no flag or default changed.
+
+| Area | Change |
+|---|---|
+| `import` | `datetimeoffset` values were shifted by their offset (`10:00+02:00` became `10:00Z`); they now land as the UTC instant (`08:00Z`). |
+| `import` | `datetime` values carried the raw 1/300 s tick (`.123333`); they are rounded to the millisecond SQL Server displays (`.123`). |
+| DuckDB extension | One binary loads on DuckDB 1.5.6 and 2.x (stable v1 C API), and the community registry serves it on DuckDB 2.0. |
+| DuckDB extension | A second, native DuckDB 2.0 build (`duckdb-neo`): `bridge_scan`, `bridge_tables`, `PRAGMA bridge_import`, `PRAGMA bridge_run`, `COPY ... TO 'mssql://...'`. See [DuckDB 2.0](#duckdb-20). |
+| `run` | The result preview of a query (first 20 rows) prints values as text, the way the DuckDB CLI does, instead of the internal debug form (`Text([66, 111, 98])`). |
+| `run` / catalog | DuckBridge no longer sets DuckDB's `lambda_syntax` option on the databases it opens; the SQL it generates uses the `lambda x:` form that DuckDB 1.5 and 2.0 both accept. |
+
 ## What changed in 0.1.1
 
 0.1.1 makes loads into shared production servers safe (see [Loading into production tables safely](#loading-into-production-tables-safely)).
@@ -552,10 +565,10 @@ after each operation to keep it small). The extension is built on DuckDB's C ext
 `extension/Makefile`), so one binary loads on DuckDB 1.5.6 and on DuckDB 2.x, whose loader keeps
 serving that table. CI builds Linux x86_64/arm64, macOS Intel/ARM and Windows. The extension is in
 the DuckDB community registry
-([duckdb/community-extensions#3147](https://github.com/duckdb/community-extensions/pull/3147), built from
-[duckbridge-extension](https://github.com/singhpratech/duckbridge-extension)); the registry builds for
-DuckDB 2.0.0, and the 0.1.1 binary it holds was still packed with the version-pinned (`C_STRUCT_UNSTABLE`)
-footer, which 2.0 refuses. Until the next registry build lands, download the
+([duckdb/community-extensions](https://github.com/duckdb/community-extensions/tree/main/extensions/duckbridge),
+built from [duckbridge-extension](https://github.com/singhpratech/duckbridge-extension)), so on DuckDB 2.0
+`INSTALL duckbridge FROM community; LOAD duckbridge;` is all it takes (Linux x86_64/arm64, macOS ARM,
+Windows). The registry builds only for DuckDB 2.0; on DuckDB 1.5.6, or for macOS Intel, download the
 `duckbridge-<platform>.duckdb_extension.zip` from the
 [releases](https://github.com/singhpratech/duckbridge/releases) and load it with `duckdb -unsigned` or
 `SET allow_unsigned_extensions = true`.

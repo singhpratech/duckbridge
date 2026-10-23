@@ -677,7 +677,16 @@ fn run(a: RunArgs, q: bool) -> Result<()> {
         let t0 = std::time::Instant::now();
         let is_query = s.to_uppercase().starts_with("SELECT") || s.to_uppercase().starts_with("WITH") || s.to_uppercase().starts_with("FROM");
         let res: Result<()> = if is_query {
-            (|| { let mut n = 0; let mut shown = 0; duck::for_each_row(&con, &s, |r| { n += 1; if shown < 20 { let w = r.as_ref().column_count(); let vals: Vec<String> = (0..w).map(|i| format!("{:?}", r.get_ref_unwrap(i))).collect(); println!("{}", vals.join(" | ")); shown += 1; } Ok(()) })?; if n > shown { println!("... {n} rows"); } Ok(()) })()
+            (|| {
+                // Preview the first 20 rows as text. Every column is cast to VARCHAR by DuckDB itself
+                // (`COLUMNS(*)::VARCHAR`), so dates, decimals and nested values print the way the
+                // DuckDB CLI prints them; a query the wrapper cannot hold falls back to the raw rows.
+                let (n, shown) = (std::cell::Cell::new(0usize), std::cell::Cell::new(0usize));
+                let show = |r: &duck::Row<'_>| { n.set(n.get() + 1); if shown.get() < 20 { let w = r.as_ref().column_count(); let vals: Vec<String> = (0..w).map(|i| match r.get_ref_unwrap(i) { duck::ValueRef::Null => "NULL".to_string(), duck::ValueRef::Text(b) => String::from_utf8_lossy(b).into_owned(), other => format!("{:?}", other) }).collect(); println!("{}", vals.join(" | ")); shown.set(shown.get() + 1); } Ok(()) };
+                let wrapped = format!("SELECT COLUMNS(*)::VARCHAR FROM ({}) AS _duckbridge_preview", s.trim_end_matches(';').trim());
+                if duck::for_each_row(&con, &wrapped, &show).is_err() { n.set(0); shown.set(0); duck::for_each_row(&con, &s, &show)?; }
+                if n.get() > shown.get() { println!("... {} rows", n.get()); } Ok(())
+            })()
         } else { duck::exec(&con, &s) };
         match res {
             Ok(_) => { ok += 1; log(q, format!("ok   ({:.2}s) {}", t0.elapsed().as_secs_f64(), s.lines().next().unwrap_or("").chars().take(100).collect::<String>())); }

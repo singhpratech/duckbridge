@@ -17,7 +17,7 @@ EXT_VERSION      := v$(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | he
 ABI              := C_STRUCT
 # DuckDB 2.0 (duckdb-neo): the build duckdb-neo pins (libduckdb-sys/.duckdb-release); the v2 C
 # extension API is unstable too, so the footer pins this exact version string.
-NEO_DUCKDB_VERSION ?= v2.0.0-alpha49003
+NEO_DUCKDB_VERSION ?= v2.0.0
 NEO_ABI            ?= C_STRUCT_UNSTABLE
 
 UNAME_S := $(shell uname -s 2>/dev/null)
